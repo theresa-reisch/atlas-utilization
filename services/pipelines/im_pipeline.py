@@ -16,6 +16,7 @@ from domain.events import (
     MC_EVENT_INFO_FIELD,
     MC_EVENT_WEIGHT_FIELD,
     MC_CHANNEL_NUMBER_FIELD,
+    MC_PILEUP_WEIGHT_FIELD,
 )
 from services.calculations.im_calculator import IMCalculator
 from services.calculations.combinatorics import get_count, get_start
@@ -194,6 +195,7 @@ def _calculate_combination_invariant_mass(
         mc_event_weights = _event_weights(
             sliced_events[MC_EVENT_INFO_FIELD],
             config.get("mc_norm_by_dsid"),
+            use_pileup_weight=bool(config.get("mc_use_pileup_weight")),
         )
 
     return inv_mass, mc_event_weights, None
@@ -202,9 +204,11 @@ def _calculate_combination_invariant_mass(
 def _event_weights(
     mc_info: ak.Array,
     norm_by_dsid: Optional[Dict[int, float]],
+    use_pileup_weight: bool = False,
 ) -> np.ndarray:
     """
-    Final per-event MC weight: generator weight x per-dataset normalization.
+    Final per-event MC weight: generator weight x per-dataset normalization
+    (x pileup weight when ``use_pileup_weight``).
 
     ``norm_by_dsid`` maps dataset number -> w_norm (computed once per DSID by
     the mass-calculation handler). Events whose dataset is not in the map, or
@@ -223,6 +227,8 @@ def _event_weights(
             factor = norm_by_dsid.get(int(dsid))
             if factor is not None:
                 norm[dsids == dsid] = factor
+    if use_pileup_weight and MC_PILEUP_WEIGHT_FIELD in mc_info.fields:
+        weights = weights * np.asarray(ak.to_numpy(mc_info[MC_PILEUP_WEIGHT_FIELD]), dtype=np.float64)
     return weights * norm
 
 

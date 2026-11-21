@@ -22,6 +22,7 @@ from domain.events import (
     MC_EVENT_WEIGHT_FIELD,
     MC_CHANNEL_NUMBER_FIELD,
     MC_RUN_NUMBER_FIELD,
+    MC_PILEUP_WEIGHT_FIELD,
     dsids_in_events,
 )
 from orchestration.context import PipelineContext
@@ -97,6 +98,7 @@ class MassCalculationHandler(StateHandler):
             "output_mode": "sqlite",
             "sqlite_writer": sqlite_writer,
             "mc_weighting_enabled": bool(mc_cfg and mc_cfg.enabled),
+            "mc_use_pileup_weight": bool(mc_cfg and mc_cfg.enabled and mc_cfg.use_pileup_weight),
             "mc_norm_by_dsid": {},
         }
         # {release: {dsid: w_norm}} — metadata is scoped per Open Data release.
@@ -237,6 +239,13 @@ class MassCalculationHandler(StateHandler):
             raise RuntimeError(
                 f"{root_file_path.name} has no per-event generator weights "
                 f"(expected branch {schemas.MC_EVENT_WEIGHT_BRANCHES.get(release)!r} "
+                f"for release {release})."
+            )
+
+        if config_dict.get("mc_use_pileup_weight") and MC_PILEUP_WEIGHT_FIELD not in mc_info.fields:
+            raise RuntimeError(
+                f"use_pileup_weight is set but {root_file_path.name} has no pileup weights "
+                f"(expected branch {schemas.MC_PILEUP_WEIGHT_BRANCHES.get(release)!r} "
                 f"for release {release})."
             )
 

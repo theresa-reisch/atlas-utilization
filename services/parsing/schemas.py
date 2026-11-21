@@ -172,6 +172,13 @@ MC_RUN_NUMBER_BRANCHES = {
     "2024r-pp": "EventInfoAuxDyn.runNumber",
 }
 
+# Per-event nominal pileup weight branches, keyed by normalized release year.
+# Only applied when mc_weighting_config.use_pileup_weight is set. It is not
+# part of sumOfWeights (which sums generator weights only).
+MC_PILEUP_WEIGHT_BRANCHES = {
+    "2024r-pp": "EventInfoAuxDyn.PileupWeight_NOSYS",
+}
+
 # MC run number -> production campaign, matching the luminosity_by_campaign keys.
 MC_RUN_NUMBER_TO_CAMPAIGN = {
     284500: "mc20a",

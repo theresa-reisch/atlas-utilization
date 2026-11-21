@@ -257,6 +257,9 @@ class MCWeightingConfig:
     # Per-campaign luminosity, e.g. {"mc20a": 36.2, "mc20d": 44.3, "mc20e": 58.5}.
     # Mutually exclusive with target_luminosity_fb.
     luminosity_by_campaign: Optional[dict] = None
+    # Multiply each event by its nominal pileup weight (PHYSLITE
+    # PileupWeight_NOSYS). The normalization (sumOfWeights) is unchanged.
+    use_pileup_weight: bool = False
 
     def __post_init__(self):
         """Validate MC weighting configuration."""
@@ -478,6 +481,7 @@ class PipelineConfig:
                 enabled=mc_dict.get("enabled", False),
                 target_luminosity_fb=mc_dict.get("target_luminosity_fb"),
                 luminosity_by_campaign=mc_dict.get("luminosity_by_campaign"),
+                use_pileup_weight=bool(mc_dict.get("use_pileup_weight", False)),
             )
             # MC weighting normalizes simulated samples only.
             if mc_weighting_config.enabled and not (config_dict.get("parsing_task_config") or {}).get("parse_mc", False):

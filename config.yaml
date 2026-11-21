@@ -86,6 +86,9 @@ mc_weighting_config:
   #   mc20d: 44.3
   #   mc20e: 58.5
   luminosity_by_campaign: null
+  # Also multiply each MC event by its nominal pileup weight (PHYSLITE
+  # EventInfoAuxDyn.PileupWeight_NOSYS). sumOfWeights is not affected.
+  use_pileup_weight: false
 
 # ============================================================================
 # STAGE CONFIGURATIONS

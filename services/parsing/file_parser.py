@@ -19,6 +19,7 @@ from domain.events import (
     MC_EVENT_WEIGHT_FIELD,
     MC_CHANNEL_NUMBER_FIELD,
     MC_RUN_NUMBER_FIELD,
+    MC_PILEUP_WEIGHT_FIELD,
 )
 
 
@@ -320,6 +321,7 @@ class FileParser:
             schemas.MC_EVENT_WEIGHT_BRANCHES.get(normalized_year): MC_EVENT_WEIGHT_FIELD,
             schemas.MC_CHANNEL_NUMBER_BRANCHES.get(normalized_year): MC_CHANNEL_NUMBER_FIELD,
             schemas.MC_RUN_NUMBER_BRANCHES.get(normalized_year): MC_RUN_NUMBER_FIELD,
+            schemas.MC_PILEUP_WEIGHT_BRANCHES.get(normalized_year): MC_PILEUP_WEIGHT_FIELD,
         }
         present = {
             branch: quantity for branch, quantity in candidates.items()
@@ -662,6 +664,8 @@ class FileParser:
                             f"{n_empty} events have an empty generator-weight vector, skipping file"
                         )
                     values = values[:, 0]  # nominal weight
+                values = ak.values_astype(values, np.float64)
+            elif quantity == MC_PILEUP_WEIGHT_FIELD:
                 values = ak.values_astype(values, np.float64)
             elif quantity in (MC_CHANNEL_NUMBER_FIELD, MC_RUN_NUMBER_FIELD):
                 values = ak.values_astype(values, np.int64)
