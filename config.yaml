@@ -79,6 +79,14 @@ parsing_task_config:
   specific_record_ids: null              # list of CERN record IDs, or null for all
   parse_mc: false
 
+  # ===MC WEIGHTS=== (only applied to "_mc" keys; data is never weighted)
+  # EventWeight = mcEventWeights[0] * PileupWeight_NOSYS * xsec*kFactor*genFiltEff*L / sumOfWeights
+  # sumOfWeights is scaled by the fraction of each DSID's files processed in the run.
+  mc_weights:
+    enabled: true
+    luminosity_fb: 36.6                  # 2015+2016 pp, legacy Run-2 calibration (3.24 + 33.40 fb^-1)
+    use_pileup_weight: true
+
   # ===PERFORMANCE===
   use_multiprocessing: false
   parallel_processes: 4

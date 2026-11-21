@@ -23,6 +23,7 @@ from domain.statistics import ParsingStatistics
 from domain.events import EventBatch
 from services.parsing.event_selection import apply_parsing_event_selection
 from utils.batching import get_batch_slice_by_year
+from services.metadata.mc_weights import McNormalizer, load_or_fetch_sample_info
 
 
 class ParsingHandler(StateHandler):
@@ -88,6 +89,55 @@ class ParsingHandler(StateHandler):
             self.logger.error(f"Failed to save chunk to {file_path}: {e}")
             raise
     
+    def _build_mc_normalizers(
+        self, parsing_config, metadata: dict, batch_idx, total_batches, max_files
+    ) -> dict:
+        """One McNormalizer per "_mc" release key, or {} when weighting is off.
+
+        The normalisation divides by the sum of weights of the files the WHOLE
+        run processes (all batch jobs), so every job reproduces the run-wide
+        file selection: the same batch slicing + per-year max_files limit that
+        each job applies to itself below.
+        """
+        cfg = parsing_config.mc_weights or {}
+        mc_keys = [k for k in metadata if k.endswith("_mc")]
+        if not mc_keys or not cfg.get("enabled", False):
+            if mc_keys:
+                self.logger.warning(
+                    "MC release keys present but mc_weights.enabled is false: "
+                    "MC histograms will be UNWEIGHTED raw event counts"
+                )
+            return {}
+
+        if batch_idx is not None and total_batches is not None:
+            job_slices = [
+                get_batch_slice_by_year(metadata, j, total_batches, log=False)
+                for j in range(1, int(total_batches) + 1)
+            ]
+        else:
+            job_slices = [metadata]
+
+        normalizers = {}
+        cache_dir = os.path.dirname(parsing_config.file_urls_path) or "."
+        for key in mc_keys:
+            release = key[: -len("_mc")]
+            processed = []
+            for sl in job_slices:
+                urls = sl.get(key, [])
+                processed.extend(urls[:max_files] if max_files and max_files > 0 else urls)
+            sample_info = load_or_fetch_sample_info(
+                os.path.join(cache_dir, f"mc_sample_info_{release}.json"), release
+            )
+            normalizers[key] = McNormalizer(
+                sample_info, cfg["luminosity_fb"], processed
+            )
+            self.logger.info(
+                f"MC weighting for '{key}': L = {cfg['luminosity_fb']} fb^-1, "
+                f"pileup weight {'on' if cfg.get('use_pileup_weight', True) else 'off'}, "
+                f"{len(processed)} files run-wide"
+            )
+        return normalizers
+
     def handle(self, context: PipelineContext) -> tuple[PipelineContext, PipelineState]:
         """
         Parse files and determine next state.
@@ -125,9 +175,16 @@ class ParsingHandler(StateHandler):
                 self.logger.info(f"Skipping MC key '{year}' (parse_mc=False)")
                 del metadata[year]
 
-        # ---- Apply batch splitting if configured ----
         batch_idx = context.config.batch_job_index
         total_batches = context.config.total_batch_jobs
+        max_files = getattr(parsing_config, 'max_files_to_process', None)
+
+        # ---- MC normalisation (needs the run-wide file selection) ----
+        mc_normalizers = self._build_mc_normalizers(
+            parsing_config, metadata, batch_idx, total_batches, max_files
+        )
+
+        # ---- Apply batch splitting if configured ----
 
         if batch_idx is not None and total_batches is not None:
             self.logger.info(
@@ -136,7 +193,6 @@ class ParsingHandler(StateHandler):
             metadata = get_batch_slice_by_year(metadata, batch_idx, total_batches)
 
         # ---- Apply max_files_to_process limit (per year) ----
-        max_files = getattr(parsing_config, 'max_files_to_process', None)
         if max_files and max_files > 0:
             for year in metadata:
                 original = len(metadata[year])
@@ -169,7 +225,12 @@ class ParsingHandler(StateHandler):
                 enable_jet_tagging=parsing_config.enable_jet_tagging,
                 jet_btagging_thresholds=parsing_config.jet_btagging_thresholds,
                 on_success=on_success,
-                on_error=on_error
+                on_error=on_error,
+                mc_norm_for_url=(
+                    mc_normalizers[release_year].norm_for_url
+                    if release_year in mc_normalizers else None
+                ),
+                use_pileup_weight=bool((parsing_config.mc_weights or {}).get("use_pileup_weight", True)),
             ):
                 if parsing_config.kinematic_cuts or parsing_config.particle_counts or parsing_config.overlap_removal:
                     filtered = apply_parsing_event_selection(

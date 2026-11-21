@@ -25,10 +25,14 @@ def process_final_state(
     output_dir: str,
     logger: logging.Logger,
     calculator: IMCalculator,
-    worker_num: Optional[int] = None
+    worker_num: Optional[int] = None,
+    fs_weights: Optional[np.ndarray] = None,
 ) -> Tuple[Dict, List[str]]:
     """
     Process all combinations for a given final state.
+
+    ``fs_weights`` (MC) are per-event weights aligned with ``fs_events``; each
+    invariant mass is stored together with its event's weight.
 
     Returns:
         Tuple of (statistics dict, list of created artifact identifiers)
@@ -50,7 +54,8 @@ def process_final_state(
     fs_mapping_threshold_bytes = config["fs_chunk_threshold_bytes"]
     output_mode = config.get("output_mode", "npy")
     sqlite_writer = config.get("sqlite_writer")
-    fs_im_mapping: Dict[str, Dict[str, ak.Array]] = {}
+    # final_state -> combination_name -> (masses [GeV], weights or None)
+    fs_im_mapping: Dict[str, Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]]] = {}
 
     stats = {
         'calculated': 0,
@@ -90,8 +95,9 @@ def process_final_state(
                 f"{stats['calculated']} calculated, {stats['skipped']} skipped"
             )
 
-        inv_mass, skip_reason = _calculate_combination_invariant_mass(
-            fs_events, combination, config, calculator, logger, final_state, worker_num
+        inv_mass, weights, skip_reason = _calculate_combination_invariant_mass(
+            fs_events, combination, config, calculator, logger, final_state, worker_num,
+            fs_weights=fs_weights,
         )
 
         if inv_mass is None:
@@ -100,12 +106,12 @@ def process_final_state(
                 stats['skip_reasons'][skip_reason] += 1
             continue
 
-        inv_mass = _convert_array_to_gev(inv_mass)
+        inv_mass = ak.to_numpy(_convert_array_to_gev(inv_mass))
 
         stats['calculated'] += 1
         combination_name = prepare_im_combination_name(filename, final_state, combination)
         saved_files = _accumulate_invariant_mass(
-            fs_im_mapping, final_state, combination_name, inv_mass,
+            fs_im_mapping, final_state, combination_name, inv_mass, weights,
             fs_mapping_threshold_bytes, output_dir, logger,
             output_mode=output_mode, sqlite_writer=sqlite_writer
         )
@@ -141,36 +147,47 @@ def _calculate_combination_invariant_mass(
     calculator: IMCalculator,
     logger: logging.Logger,
     final_state: str,
-    worker_num: Optional[int] = None
-) -> Tuple[Optional[ak.Array], Optional[str]]:
+    worker_num: Optional[int] = None,
+    fs_weights: Optional[np.ndarray] = None,
+) -> Tuple[Optional[ak.Array], Optional[np.ndarray], Optional[str]]:
+    """Returns (invariant masses [MeV], matching per-event weights or None, skip reason)."""
     logger.debug(f"Processing combination: {combination} for final state: {final_state}")
 
-    filtered_events = calculator.filter_by_particle_counts(
-        events=fs_events, particle_counts=combination, is_exact_count=True
+    filtered_events, event_mask = calculator.filter_by_particle_counts(
+        events=fs_events, particle_counts=combination, is_exact_count=True,
+        return_mask=True,
     )
     if len(filtered_events) == 0:
-        return None, 'no_events_after_filter'
+        return None, None, 'no_events_after_filter'
+    weights = fs_weights[event_mask] if fs_weights is not None else None
 
+    # slicing keeps every event (it only trims the object lists), so the
+    # weights stay aligned: one invariant mass per surviving event
     field_to_slice_by = config["field_to_slice_by"]
     sliced_events = calculator.slice_by_field(
         events=filtered_events, particle_counts=combination,
         field_to_slice_by=field_to_slice_by
     )
     if len(sliced_events) == 0:
-        return None, 'no_events_after_slice'
+        return None, None, 'no_events_after_slice'
 
     inv_mass = calculator.calculate_invariant_mass(sliced_events)
     if not ak.any(inv_mass):
-        return None, 'empty_inv_mass'
+        return None, None, 'empty_inv_mass'
+    if weights is not None and len(weights) != len(inv_mass):
+        raise RuntimeError(
+            f"{final_state} {combination}: {len(inv_mass)} masses vs {len(weights)} weights"
+        )
 
-    return inv_mass, None
+    return inv_mass, weights, None
 
 
 def _accumulate_invariant_mass(
-    fs_im_mapping: Dict[str, Dict[str, ak.Array]],
+    fs_im_mapping: Dict[str, Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]]],
     final_state: str,
     combination_name: str,
-    inv_mass: ak.Array,
+    inv_mass: np.ndarray,
+    weights: Optional[np.ndarray],
     threshold_bytes: int,
     output_dir: str,
     logger: logging.Logger,
@@ -181,10 +198,15 @@ def _accumulate_invariant_mass(
         fs_im_mapping[final_state] = {}
 
     if combination_name in fs_im_mapping[final_state]:
-        existing_im = fs_im_mapping[final_state][combination_name]
-        fs_im_mapping[final_state][combination_name] = ak.concatenate([existing_im, inv_mass])
+        existing_im, existing_w = fs_im_mapping[final_state][combination_name]
+        if (existing_w is None) != (weights is None):
+            raise RuntimeError(f"{combination_name}: mixing weighted and unweighted chunks")
+        fs_im_mapping[final_state][combination_name] = (
+            np.concatenate([existing_im, inv_mass]),
+            None if weights is None else np.concatenate([existing_w, weights]),
+        )
     else:
-        fs_im_mapping[final_state][combination_name] = inv_mass
+        fs_im_mapping[final_state][combination_name] = (inv_mass, weights)
 
     saved_files = []
     if _fs_dict_exceeding_threshold(fs_im_mapping, threshold_bytes):
@@ -236,15 +258,20 @@ def _save_fs_mapping(
         if sqlite_writer is None:
             raise ValueError("output_mode='sqlite' requires sqlite_writer in config")
         to_write = {}
-        for combination_name, im_arr in fs_mapping.items():
-            to_write[combination_name] = ak.to_numpy(im_arr)
+        for combination_name, (im_arr, weights) in fs_mapping.items():
+            to_write[combination_name] = (im_arr, weights)
             saved_files.append(combination_name)
         if to_write:
             sqlite_writer.append_many(to_write)
             sqlite_writer.commit()
         return saved_files
 
-    for combination_name, im_arr in fs_mapping.items():
+    # Legacy .npy mode stores masses only (no weights).
+    for combination_name, (im_arr, weights) in fs_mapping.items():
+        if weights is not None:
+            logging.getLogger(__name__).warning(
+                f"{combination_name}: npy output mode drops MC weights; use sqlite"
+            )
         filename = f"{combination_name}.npy"
         output_path = os.path.join(output_dir, filename)
         if os.path.exists(output_path):
@@ -267,14 +294,11 @@ def _fs_dict_exceeding_threshold(fs_im_mapping: Dict, threshold: int) -> bool:
         if not isinstance(combinations, dict):
             continue
         total_size += sys.getsizeof(fs) + sys.getsizeof(combinations)
-        for name, arr in combinations.items():
+        for name, (arr, weights) in combinations.items():
             total_size += sys.getsizeof(name)
-            if hasattr(arr, 'layout'):
-                total_size += arr.layout.nbytes
-            elif hasattr(arr, 'nbytes'):
-                total_size += arr.nbytes
-            else:
-                total_size += sys.getsizeof(arr)
+            total_size += arr.nbytes
+            if weights is not None:
+                total_size += weights.nbytes
 
     return total_size >= threshold
 

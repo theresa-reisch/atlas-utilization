@@ -51,7 +51,9 @@ class ThreadedFileProcessor:
         enable_jet_tagging: bool = False,
         jet_btagging_thresholds: Optional[dict[str, float]] = None,
         on_success: Optional[Callable[[str, int, float], None]] = None,
-        on_error: Optional[Callable[[str, Exception], None]] = None
+        on_error: Optional[Callable[[str, Exception], None]] = None,
+        mc_norm_for_url: Optional[Callable[[str], float]] = None,
+        use_pileup_weight: bool = True,
     ) -> Iterator[EventBatch]:
         """
         Process multiple files concurrently and yield EventBatch objects.
@@ -80,6 +82,8 @@ class ThreadedFileProcessor:
                     batch_size,
                     enable_jet_tagging,
                     jet_btagging_thresholds,
+                    mc_norm_for_url,
+                    use_pileup_weight,
                 ): file_url
                 for file_url in file_urls
             }
@@ -128,6 +132,8 @@ class ThreadedFileProcessor:
         batch_size: int,
         enable_jet_tagging: bool,
         jet_btagging_thresholds: Optional[dict[str, float]],
+        mc_norm_for_url: Optional[Callable[[str], float]] = None,
+        use_pileup_weight: bool = True,
     ) -> Optional[tuple]:
         """
         Parse a single file (runs in thread).
@@ -143,7 +149,12 @@ class ThreadedFileProcessor:
         """
         import time
         start_time = time.time()
-        
+
+        # MC: per-file normalisation. Raises (file counted as failed) when the
+        # sample's cross-section / sum of weights are unknown, so unnormalised
+        # events never reach the histograms.
+        mc_norm = mc_norm_for_url(file_url) if mc_norm_for_url else None
+
         events = self.file_parser.parse_file(
             file_path=file_url,
             tree_names=tree_names,
@@ -151,8 +162,10 @@ class ThreadedFileProcessor:
             batch_size=batch_size,
             enable_jet_tagging=enable_jet_tagging,
             jet_btagging_thresholds=jet_btagging_thresholds,
+            mc_norm=mc_norm,
+            use_pileup_weight=use_pileup_weight,
         )
-        
+
         processing_time = time.time() - start_time
         
         if events is None:

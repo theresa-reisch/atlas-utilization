@@ -14,6 +14,7 @@ from typing import Optional
 
 from services.parsing import schemas
 from services import consts
+from services.metadata import mc_weights
 
 
 class FileParser:
@@ -31,10 +32,16 @@ class FileParser:
         batch_size: int = 40_000,
         enable_jet_tagging: bool = False,
         jet_btagging_thresholds: Optional[dict[str, float]] = None,
+        mc_norm: Optional[float] = None,
+        use_pileup_weight: bool = True,
     ) -> Optional[ak.Array]:
         """
         Parse a single ROOT file and return events.
-        
+
+        If ``mc_norm`` is given (MC files), an event-level float field
+        ``EventWeight = mcEventWeights[0] * PileupWeight_NOSYS * mc_norm`` is
+        added as the last field of the returned record.
+
         Args:
             file_path: Path or URI to ROOT file
             tree_names: List of possible tree names to search for
@@ -54,6 +61,8 @@ class FileParser:
                     file_path,
                     enable_jet_tagging,
                     jet_btagging_thresholds,
+                    mc_norm,
+                    use_pileup_weight,
                 )
         except Exception as e:
             logging.warning(f"Failed to open file {file_path}: {e}")
@@ -67,7 +76,9 @@ class FileParser:
         batch_size: int,
         file_path: str,
         enable_jet_tagging: bool,
-        jet_btagging_thresholds: Optional[dict[str, float]]
+        jet_btagging_thresholds: Optional[dict[str, float]],
+        mc_norm: Optional[float] = None,
+        use_pileup_weight: bool = True,
     ) -> Optional[ak.Array]:
         """Parse an already-opened ROOT file."""
         tree_name = FileParser._get_data_tree_name(root_file.keys(), tree_names)
@@ -90,19 +101,55 @@ class FileParser:
             logging.warning(f"No accessible particles found in file {file_path}")
             return None
         
+        event_branches = []
+        if mc_norm is not None:
+            if mc_weights.MC_EVENT_WEIGHTS_BRANCH not in all_tree_branches:
+                raise ValueError(
+                    f"MC weighting requested but {mc_weights.MC_EVENT_WEIGHTS_BRANCH} "
+                    f"is missing in {file_path}"
+                )
+            event_branches.append(mc_weights.MC_EVENT_WEIGHTS_BRANCH)
+            if use_pileup_weight:
+                if mc_weights.PILEUP_WEIGHT_BRANCH in all_tree_branches:
+                    event_branches.append(mc_weights.PILEUP_WEIGHT_BRANCH)
+                else:
+                    logging.warning(
+                        f"{mc_weights.PILEUP_WEIGHT_BRANCH} missing in {file_path}; "
+                        "using pileup weight 1"
+                    )
+
         all_branches = set(itertools.chain.from_iterable(obj_branches.values()))
-        obj_events = FileParser._read_file_in_batches(
+        all_branches.update(event_branches)
+        obj_events, event_arrays = FileParser._read_file_in_batches(
             tree,
             all_branches,
             obj_branches,
             n_entries,
-            batch_size
+            batch_size,
+            event_branches=event_branches,
         )
         if enable_jet_tagging:
             obj_events = FileParser._calculate_btagging_and_split(obj_events, jet_btagging_thresholds)
         # Strip out DirectObjects -- they are not physics objects!
-        obj_events.pop("DirectObjects")
+        obj_events.pop("DirectObjects", None)
+        if mc_norm is not None:
+            # Must stay the LAST field: downstream code takes events.fields[0]
+            # as a particle collection.
+            obj_events["EventWeight"] = FileParser._compute_event_weight(
+                event_arrays, mc_norm
+            )
         return ak.zip(obj_events, depth_limit=1)
+
+    @staticmethod
+    def _compute_event_weight(event_arrays: dict, mc_norm: float) -> np.ndarray:
+        """mcEventWeights[0] * PileupWeight_NOSYS (if read) * mc_norm, per event."""
+        gen = event_arrays[mc_weights.MC_EVENT_WEIGHTS_BRANCH]
+        # index 0 is the nominal generator weight; guard against empty vectors
+        w = ak.to_numpy(ak.fill_none(ak.firsts(gen), 0.0)).astype(np.float64)
+        pu = event_arrays.get(mc_weights.PILEUP_WEIGHT_BRANCH)
+        if pu is not None:
+            w = w * ak.to_numpy(pu).astype(np.float64)
+        return w * float(mc_norm)
 
     @staticmethod
     def _calculate_btagging_and_split(
@@ -428,11 +475,19 @@ class FileParser:
         all_branches: set[str],
         obj_branches: dict[str, dict[str, str]],
         n_entries: int,
-        batch_size: int
-    ) -> dict[str, ak.Array]:
+        batch_size: int,
+        event_branches: Optional[list[str]] = None,
+    ) -> tuple[dict[str, ak.Array], dict[str, ak.Array]]:
+        """Returns (per-object arrays, event-level arrays for ``event_branches``).
+
+        Event-level arrays come from the same batches as the objects, so they
+        stay aligned even if a batch fails to read and is skipped.
+        """
+        event_branches = event_branches or []
         obj_events_by_quantities = {
             obj_name: [] for obj_name in obj_branches.keys()
         }
+        event_chunks = {b: [] for b in event_branches}
         
         is_file_big = n_entries > batch_size
         if is_file_big:
@@ -454,7 +509,10 @@ class FileParser:
             except Exception as e:
                 logging.warning(f"Error reading batch {entry_start}-{entry_stop}: {e}")
                 continue
-            
+
+            for b in event_branches:
+                event_chunks[b].append(batch_data[b])
+
             for obj_name, branch_mapping in obj_branches.items():
                 available_branches = [
                     b for b in branch_mapping.keys() if b in batch_data.fields
@@ -472,8 +530,11 @@ class FileParser:
                     quantity: concatenated[full_branch]
                     for full_branch, quantity in obj_branches[obj_name].items()
                 })
-        
-        return result
+
+        event_arrays = {
+            b: ak.concatenate(chunks) for b, chunks in event_chunks.items() if chunks
+        }
+        return result, event_arrays
     
     @staticmethod
     def _auto_detect_branches(tree_branches: set[str]) -> dict[str, dict[str, str]]:

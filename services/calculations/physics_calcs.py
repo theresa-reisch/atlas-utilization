@@ -46,8 +46,10 @@ def concat_events(particle_events: ak.Array) -> list:
 
 
 def get_particle_known_mass(particle_type: str, particle_array: ak.Array) -> ak.Array:
-    if 'm' in particle_array.fields:
-        return particle_array.m
+    # Parsed collections store their mass under "mass" (file_parser maps the
+    # PHYSLITE '.m' branch to "mass"); fall back to a fixed PDG mass otherwise.
+    if 'mass' in particle_array.fields:
+        return particle_array.mass
     return consts.KNOWN_MASSES.get(particle_type, 0.0)
 
 
@@ -132,16 +134,20 @@ def filter_events_by_particle_counts(
     events: ak.Array,
     particle_counts: Dict,
     is_exact_count: bool = False,
-    is_particle_counts_range: bool = False
-) -> ak.Array:
+    is_particle_counts_range: bool = False,
+    return_mask: bool = False,
+):
     """
     Filter events by particle counts.
     Accepts both plain-int and (count, start_index) combination values.
     For sub-leading combinations, filters to events that have at least
     start + count particles of each required type.
+
+    With ``return_mask=True`` returns ``(filtered_events, event_mask)`` so
+    parallel per-event arrays (e.g. MC weights) can be filtered the same way.
     """
     if len(events) == 0:
-        return events
+        return (events, np.zeros(0, dtype=bool)) if return_mask else events
 
     combined_mask = ak.ones_like(ak.num(events[events.fields[0]]), dtype=bool)
 
@@ -176,6 +182,7 @@ def filter_events_by_particle_counts(
         combined_mask = combined_mask & particle_mask
 
     filtered_events = events[combined_mask]
+    event_mask = ak.to_numpy(combined_mask) if return_mask else None
     del combined_mask
     gc.collect()
 
@@ -187,10 +194,11 @@ def filter_events_by_particle_counts(
                 fields_to_keep[actual_field] = filtered_events[actual_field]
 
         if len(fields_to_keep) == 0:
-            return ak.Array([])
+            return (ak.Array([]), np.zeros(len(events), dtype=bool)) if return_mask else ak.Array([])
         filtered_events = ak.zip(fields_to_keep, depth_limit=1)
 
-    return ak.to_packed(filtered_events)
+    filtered_events = ak.to_packed(filtered_events)
+    return (filtered_events, event_mask) if return_mask else filtered_events
 
 
 def slice_events_by_field(

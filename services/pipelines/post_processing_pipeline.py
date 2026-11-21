@@ -19,6 +19,7 @@ import math
 from services.storage.sqlite_shards import (
     SqliteArrayShardWriter,
     iter_arrays_for_signature,
+    iter_weighted_arrays_for_signature,
     list_signatures,
 )
 
@@ -53,20 +54,25 @@ def _apply_z_peak_cut(
     The array is returned untouched for every other
     channel and when the cut is disabled (cutoff <= 0).
     """
-    if z_peak_cutoff <= 0:
-        return arr
+    return arr[_z_peak_keep_mask(arr, signature, z_peak_cutoff, logger)]
 
-    if not _dilepton_flavor(signature):
-        return arr
 
-    kept = arr[arr >= z_peak_cutoff]
-    removed = len(arr) - len(kept)
+def _z_peak_keep_mask(
+    arr: np.ndarray, signature: str, z_peak_cutoff: float, logger: logging.Logger
+) -> np.ndarray:
+    """Boolean keep-mask for the Z-peak cut (all True when it doesn't apply)."""
+    keep = np.ones(len(arr), dtype=bool)
+    if z_peak_cutoff <= 0 or not _dilepton_flavor(signature):
+        return keep
+
+    keep = arr >= z_peak_cutoff
+    removed = int((~keep).sum())
     if removed:
         logger.debug(
             f"{signature}: Z-peak cut removed {removed} dilepton values "
             f"below {z_peak_cutoff:.1f} GeV"
         )
-    return kept
+    return keep
 
 
 def process_im_arrays(config: Dict, file_list: Optional[List[str]] = None) -> List[str]:
@@ -200,11 +206,11 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
     try:
         for fs_im_key in sorted(fs_im_groups.keys()):
             chunk_sigs = fs_im_groups[fs_im_key]
-            chunks = []
+            chunks = []   # (masses, weights) pairs; weights are 1 for data
             for sig in chunk_sigs:
                 for filename in sqlite_files:
                     db_path = os.path.join(input_dir, filename)
-                    chunks.extend(iter_arrays_for_signature(db_path, sig))
+                    chunks.extend(iter_weighted_arrays_for_signature(db_path, sig))
     # written = 0
     # COMMIT_EVERY = 1000  # commit every 1000 signatures to keep WAL small
     # processed = 0
@@ -217,30 +223,35 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             if not chunks:
                 continue
 
-            arr = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            arr = np.concatenate([c[0] for c in chunks])
+            w = np.concatenate([c[1] for c in chunks])
             if len(arr) == 0:
                 continue
 
-            # Remove the Z resonance before peak detection
-            arr = _apply_z_peak_cut(arr, fs_im_key, z_peak_cutoff, logger)
-            arr = arr[arr <= max_mass_cutoff] if max_mass_cutoff > 0 else arr
+            # Every cut is a mask so the weights follow their masses.
+            keep = _z_peak_keep_mask(arr, fs_im_key, z_peak_cutoff, logger)
+            if max_mass_cutoff > 0:
+                keep &= arr <= max_mass_cutoff
+            arr, w = arr[keep], w[keep]
             if len(arr) == 0:
                 continue
 
             if enable_peak_removal:
+                # peak position from raw counts (unweighted), as before
                 peak_mass = _find_rightmost_highest_peak(arr, bin_width, logger)
-                filtered = arr if peak_mass is None else arr[arr >= peak_mass]
-            else:
-                filtered = arr
-            if len(filtered) == 0:
+                if peak_mass is not None:
+                    keep = arr >= peak_mass
+                    arr, w = arr[keep], w[keep]
+            if len(arr) == 0:
                 continue
 
-            main_array, outliers_array = _split_by_first_empty_bin(filtered, bin_width, logger)
-            if len(main_array) > 0:
-                writer.append_array(f"{fs_im_key}_main", main_array)
+            split_mass = _find_split_mass(arr, bin_width, logger)
+            is_main = np.ones(len(arr), dtype=bool) if split_mass is None else arr < split_mass
+            if is_main.any():
+                writer.append_array(f"{fs_im_key}_main", arr[is_main], w[is_main])
                 written += 1
-            if len(outliers_array) > 0:
-                writer.append_array(f"{fs_im_key}_outliers", outliers_array)
+            if (~is_main).any():
+                writer.append_array(f"{fs_im_key}_outliers", arr[~is_main], w[~is_main])
                 written += 1
 
             processed += 1                          # ← new
@@ -355,34 +366,38 @@ def _split_by_first_empty_bin(
     if len(im_array) == 0:
         return np.array([]), np.array([])
 
+    split_mass = _find_split_mass(im_array, bin_width, logger)
+    if split_mass is None:
+        return im_array, np.array([])
+    return im_array[im_array < split_mass], im_array[im_array >= split_mass]
+
+
+def _find_split_mass(
+    im_array: np.ndarray, bin_width: float, logger: logging.Logger
+) -> Optional[float]:
+    """Lower edge of the first empty bin (main/outlier boundary), or None for no split."""
+    if len(im_array) == 0:
+        return None
+
     min_mass = np.min(im_array)
     max_mass = np.max(im_array)
     nbins = math.ceil((max_mass - min_mass) / bin_width)
     if nbins == 0:
-        return im_array, np.array([])
+        return None
 
     bin_edges = np.linspace(min_mass, max_mass, nbins + 1)
     counts, _ = np.histogram(im_array, bins=bin_edges)
 
-    first_empty_bin_idx = None
-    for i in range(len(counts)):
-        if counts[i] == 0:
-            first_empty_bin_idx = i
-            break
+    empty = np.flatnonzero(counts == 0)
+    first_empty_bin_idx = int(empty[0]) if len(empty) else None
 
     if first_empty_bin_idx is None or first_empty_bin_idx <= 1:
         logger.debug("No empty bin found or at position 1, keeping all data in main array")
-        return im_array, np.array([])
+        return None
 
-    split_mass = bin_edges[first_empty_bin_idx]
-    main_array = im_array[im_array < split_mass]
-    outliers_array = im_array[im_array >= split_mass]
-
-    logger.debug(
-        f"Split at bin {first_empty_bin_idx} (mass = {split_mass:.2f} GeV): "
-        f"main={len(main_array)}, outliers={len(outliers_array)}"
-    )
-    return main_array, outliers_array
+    split_mass = float(bin_edges[first_empty_bin_idx])
+    logger.debug(f"Split at bin {first_empty_bin_idx} (mass = {split_mass:.2f} GeV)")
+    return split_mass
 
 
 def _get_batch_files(files: List[str], batch_index: int, total_batches: int) -> List[str]:

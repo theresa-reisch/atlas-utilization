@@ -13,6 +13,8 @@ import numpy as np
 
 from services.calculations import physics_calcs
 
+EVENT_WEIGHT_FIELD = "EventWeight"
+
 YAML_PARTICLE_KEYS: Dict[str, str] = {
     "electrons": "Electrons",
     "muons": "Muons",
@@ -77,7 +79,19 @@ def apply_parsing_event_selection(
     Kinematic cuts are applied per particle type first, then delta-R overlap
     removal between collections, then event-level particle count ranges —
     count ranges must see post-overlap-removal counts, not raw ones.
+
+    An event-level ``EventWeight`` field (MC) is held aside during the
+    per-object steps and re-attached as the last field, so the event-count
+    filter keeps it aligned with the surviving events.
     """
+    weights = None
+    if EVENT_WEIGHT_FIELD in events.fields:
+        weights = events[EVENT_WEIGHT_FIELD]
+        events = ak.zip(
+            {f: events[f] for f in events.fields if f != EVENT_WEIGHT_FIELD},
+            depth_limit=1,
+        )
+
     if kinematic_cuts:
         by_obj: Dict[str, Dict[str, Any]] = {}
         for key, val in kinematic_cuts.items():
@@ -90,6 +104,13 @@ def apply_parsing_event_selection(
     if overlap_removal:
         rules = normalize_yaml_overlap_removal(overlap_removal)
         events = physics_calcs.remove_overlapping_objects(events, rules)
+
+    if weights is not None:
+        # kinematic cuts and overlap removal never drop events, only objects
+        events = ak.zip(
+            {**{f: events[f] for f in events.fields}, EVENT_WEIGHT_FIELD: weights},
+            depth_limit=1,
+        )
 
     if particle_counts:
         mapped: Dict[str, Any] = {}

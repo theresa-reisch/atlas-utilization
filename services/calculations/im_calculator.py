@@ -5,8 +5,9 @@ Provides a clean interface for calculating invariant masses from particle events
 Supports grouping by final state, filtering, and batch processing.
 """
 import awkward as ak
+import numpy as np
 import vector
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional
 from collections import Counter
 
 from services.calculations import consts, physics_calcs
@@ -17,8 +18,13 @@ class IMCalculator:
     _INVALID_FS_LABEL = "" # sentinal value for invalid final states
 
     def __init__(self, events: ak.Array, min_events_per_fs: int,
-                 min_k: int, max_k: int, min_n: int, max_n: int):
+                 min_k: int, max_k: int, min_n: int, max_n: int,
+                 weights: Optional[np.ndarray] = None):
         self.events = events
+        # Optional per-event MC weights, aligned with ``events``.
+        if weights is not None and len(weights) != len(events):
+            raise ValueError(f"{len(weights)} weights for {len(events)} events")
+        self.weights = weights
         self.min_events_per_fs = min_events_per_fs
         self.min_k = min_k
         self.max_k = max_k
@@ -55,8 +61,10 @@ class IMCalculator:
 
     @staticmethod
     def _get_particle_mass(particle_type: str, particle_array: ak.Array) -> ak.Array:
-        if 'm' in particle_array.fields:
-            return particle_array.m
+        # Parsed collections store their mass under "mass" (file_parser maps the
+        # PHYSLITE '.m' branch to "mass"); fall back to a fixed PDG mass otherwise.
+        if 'mass' in particle_array.fields:
+            return particle_array.mass
         return consts.KNOWN_MASSES.get(particle_type, 0.0)
 
     def _get_all_events_fs(self) -> ak.Array:
@@ -109,6 +117,13 @@ class IMCalculator:
         mask = (all_events_fs == final_state)
         return self.events[mask]
 
+    def get_weights_for_final_state(self, final_state: str) -> Optional[np.ndarray]:
+        """Per-event weights for the events returned by get_events_for_final_state."""
+        if self.weights is None:
+            return None
+        mask = ak.to_numpy(self._get_all_events_fs() == final_state)
+        return self.weights[mask]
+
     @staticmethod
     def _limit_particles_in_fs(final_state: str, threshold: int = 4) -> str:
         fs_particles = final_state.split('_')
@@ -157,9 +172,11 @@ class IMCalculator:
         return True
 
     def filter_by_particle_counts(self, events, particle_counts,
-                                  is_exact_count=False, is_particle_counts_range=False):
+                                  is_exact_count=False, is_particle_counts_range=False,
+                                  return_mask=False):
         return physics_calcs.filter_events_by_particle_counts(
-            events, particle_counts, is_exact_count, is_particle_counts_range)
+            events, particle_counts, is_exact_count, is_particle_counts_range,
+            return_mask=return_mask)
 
     def filter_by_kinematics(self, events, kinematic_cuts):
         return physics_calcs.filter_events_by_kinematics(events, kinematic_cuts)

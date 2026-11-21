@@ -15,7 +15,15 @@ from collections import defaultdict
 import numpy as np
 import ROOT
 import math
-from services.storage.sqlite_shards import list_signatures, iter_arrays_for_signature
+from services.storage.sqlite_shards import (
+    list_signatures,
+    iter_arrays_for_signature,
+    iter_weighted_arrays_for_signature,
+)
+
+# Per-bin sum of squared weights, so MC histograms carry correct errors
+# (identical to sqrt(N) errors for unweighted data).
+ROOT.TH1.SetDefaultSumw2(True)
 
 
 def save_global_ranges(ranges: Dict, output_path: str):
@@ -306,6 +314,24 @@ def _group_signatures_by_bumpnet(signatures: List[str]) -> Dict[str, List[str]]:
     return dict(groups)
 
 
+def _iter_weighted_signature_chunks(signature: str, db_paths: List[str]):
+    """Yield (masses, weights) float64 arrays; weights are 1 for unweighted data."""
+    for db_path in db_paths:
+        for arr, w in iter_weighted_arrays_for_signature(db_path, signature):
+            if len(arr) > 0:
+                yield (
+                    np.ascontiguousarray(arr, dtype=np.float64),
+                    np.ascontiguousarray(w, dtype=np.float64),
+                )
+
+
+def _fill_weighted(hists, signature: str, db_paths: List[str]) -> None:
+    """Vectorised weighted fill (TH1::FillN) instead of a per-value Python loop."""
+    for arr, w in _iter_weighted_signature_chunks(signature, db_paths):
+        for hist in hists:
+            hist.FillN(len(arr), arr, w)
+
+
 def _iter_signature_chunks(signature: str, db_paths: List[str]):
     for db_path in db_paths:
         for arr in iter_arrays_for_signature(db_path, signature):
@@ -336,10 +362,7 @@ def _create_histograms_for_signature(
         hist = ROOT.TH1F(hist_name, hist_name, nbins, global_min, global_max)
         histograms.append(hist)
 
-    for chunk in _iter_signature_chunks(signature, db_paths):
-        for hist in histograms:
-            for val in chunk:
-                hist.Fill(float(val))
+    _fill_weighted(histograms, signature, db_paths)
     if apply_peak_removal:
         for hist in histograms:
             _apply_peak_removal_to_histogram(hist)
@@ -395,10 +418,7 @@ def _create_merged_histograms_from_sqlite_signatures(
         )
 
     for signature in signatures:
-        for chunk in _iter_signature_chunks(signature, db_paths):
-            for hist in histograms:
-                for val in chunk:
-                    hist.Fill(float(val))
+        _fill_weighted(histograms, signature, db_paths)
     if apply_peak_removal:
         for hist in histograms:
             _apply_peak_removal_to_histogram(hist)

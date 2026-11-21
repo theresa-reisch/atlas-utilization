@@ -63,9 +63,16 @@ class ParsingConfig:
     kinematic_cuts: Optional[dict] = None
     # Sequential delta-R overlap removal rules: ({"keep": ..., "remove": ..., "delta_r_min": ...}, ...)
     overlap_removal: Optional[tuple[dict, ...]] = None
+    # MC event weighting for "_mc" release keys:
+    # {"enabled": bool, "luminosity_fb": float, "use_pileup_weight": bool}
+    mc_weights: Optional[dict] = None
 
     def __post_init__(self):
         """Validate parsing configuration."""
+        if self.mc_weights and self.mc_weights.get("enabled", True):
+            lumi = self.mc_weights.get("luminosity_fb")
+            if not isinstance(lumi, (int, float)) or lumi <= 0:
+                raise ValueError(f"mc_weights.luminosity_fb must be a positive number, got {lumi!r}")
         if self.threads <= 0:
             raise ValueError(f"threads must be positive, got {self.threads}")
         if self.chunk_yield_threshold_bytes <= 0:
@@ -327,6 +334,7 @@ class PipelineConfig:
                 particle_counts=parsing_dict.get("particle_counts"),
                 kinematic_cuts=parsing_dict.get("kinematic_cuts"),
                 overlap_removal=tuple(parsing_dict["overlap_removal"]) if parsing_dict.get("overlap_removal") else None,
+                mc_weights=parsing_dict.get("mc_weights"),
             )
         
         # Parse mass calculation config if enabled

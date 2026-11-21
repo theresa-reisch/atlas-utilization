@@ -226,10 +226,14 @@ class MassCalculationHandler(StateHandler):
         """Read one parsed ROOT file and compute invariant masses."""
         self.logger.info(f"Reading parsed file: {root_file_path.name}")
 
+        weights = None
         with uproot.open(str(root_file_path)) as f:
             if "events" in f:
                 tree = f["events"]
                 particle_arrays = self._reconstruct_particle_arrays(tree)
+                # MC: per-event weight written by the parsing stage
+                if "EventWeight" in tree.keys():
+                    weights = tree["EventWeight"].array(library="np").astype(np.float64)
             elif "CollectionTree" in f:
                 tree = f["CollectionTree"]
                 particle_arrays = self._reconstruct_from_atlas_tree(tree)
@@ -248,6 +252,11 @@ class MassCalculationHandler(StateHandler):
             f"{root_file_path.name}: {num_events:,} events loaded "
             f"(particle types: {particle_arrays.fields})"
         )
+        if weights is not None:
+            self.logger.info(
+                f"{root_file_path.name}: MC weights present, sum = {weights.sum():.6g} "
+                f"({(weights < 0).sum()} negative)"
+            )
 
         # Initialise calculator
         calculator = IMCalculator(
@@ -257,6 +266,7 @@ class MassCalculationHandler(StateHandler):
             max_k=mc.max_count_particle_in_combination,
             min_n=mc.min_particles_in_combination,
             max_n=mc.max_particles_in_combination,
+            weights=weights,
         )
 
         created_files: List[str] = []
@@ -272,6 +282,7 @@ class MassCalculationHandler(StateHandler):
                 output_dir,
                 self.logger,
                 calculator,
+                fs_weights=calculator.get_weights_for_final_state(cur_fs),
             )
             if result is None:
                 continue

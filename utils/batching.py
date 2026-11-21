@@ -54,6 +54,7 @@ def get_batch_slice_by_year(
     file_ids_by_year: dict,
     batch_index: int,
     total_batches: int,
+    log: bool = True,
 ) -> dict:
     """
     Split file URLs across batch jobs, preserving year grouping.
@@ -87,8 +88,9 @@ def get_batch_slice_by_year(
 
     total_all = sum(len(v) for v in file_ids_by_year.values())
     total_batch = sum(len(v) for v in result.values())
-    logger.info(
-        f"Batch {batch_index}/{total_batches}: "
-        f"{total_batch} files (of {total_all} total) across {len(result)} year(s)"
-    )
+    if log:
+        logger.info(
+            f"Batch {batch_index}/{total_batches}: "
+            f"{total_batch} files (of {total_all} total) across {len(result)} year(s)"
+        )
     return result
