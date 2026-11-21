@@ -83,6 +83,7 @@ def process_im_arrays(config: Dict, file_list: Optional[List[str]] = None) -> Li
     peak_detection_bin_width_gev = config["peak_detection_bin_width_gev"]
     z_peak_cutoff = config["z_peak_cutoff"]
     max_mass_cutoff = config["max_mass_cutoff"]
+    enable_peak_removal = config.get("enable_peak_removal", True)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -145,7 +146,7 @@ def process_im_arrays(config: Dict, file_list: Optional[List[str]] = None) -> Li
         try:
             output_files = _process_single_array(
                 im_array_filename, input_dir, output_dir, peak_detection_bin_width_gev, logger,
-                z_peak_cutoff, max_mass_cutoff
+                z_peak_cutoff, max_mass_cutoff, enable_peak_removal
             )
             if output_files:
                 processed_files.extend(output_files)
@@ -162,6 +163,7 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
     bin_width = config["peak_detection_bin_width_gev"]
     z_peak_cutoff = config["z_peak_cutoff"]
     max_mass_cutoff = config["max_mass_cutoff"]
+    enable_peak_removal = config.get("enable_peak_removal", True)
     min_events_per_fs = int(config.get("min_events_per_fs", 0))
     db_paths = [os.path.join(input_dir, filename) for filename in sqlite_files]
     removed_final_states = prune_final_states_below_min_events(
@@ -265,7 +267,10 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             # The peak is located on the weighted spectrum when weights exist:
             # that is the distribution BumpNet will see, and for sliced samples
             # the raw-count maximum sits where the tiny-weight slice piles up.
-            peak_mass = _find_rightmost_highest_peak(arr, bin_width, logger, weights=warr)
+            peak_mass = (
+                _find_rightmost_highest_peak(arr, bin_width, logger, weights=warr)
+                if enable_peak_removal else None
+            )
             if peak_mass is not None:
                 keep = arr >= peak_mass
                 arr = arr[keep]
@@ -304,7 +309,8 @@ def _process_single_array(
     filename: str, input_dir: str, output_dir: str,
     peak_detection_bin_width_gev: float, logger: logging.Logger,
     z_peak_cutoff: float,
-    max_mass_cutoff: float
+    max_mass_cutoff: float,
+    enable_peak_removal: bool = True,
 ) -> List[str]:
     file_path = os.path.join(input_dir, filename)
     im_array = np.load(file_path)
@@ -323,9 +329,9 @@ def _process_single_array(
         return []
 
     bin_width = peak_detection_bin_width_gev
-    peak_mass = _find_rightmost_highest_peak(im_array, bin_width, logger)
-
-    if peak_mass is None:
+    if not enable_peak_removal:
+        filtered_array = im_array
+    elif (peak_mass := _find_rightmost_highest_peak(im_array, bin_width, logger)) is None:
         logger.warning(f"Could not find peak in {filename}, keeping all data")
         filtered_array = im_array
     else:

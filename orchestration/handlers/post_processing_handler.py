@@ -36,6 +36,7 @@ class PostProcessingHandler(StateHandler):
             "peak_detection_bin_width_gev": pp.peak_detection_bin_width_gev,
             "z_peak_cutoff": pp.z_peak_cutoff,
             "max_mass_cutoff": pp.max_mass_cutoff,
+            "enable_peak_removal": pp.enable_peak_removal,
             "batch_job_index": context.config.batch_job_index,
             "min_events_per_fs": (
                 context.config.mass_calculation_config.min_events_per_fs
