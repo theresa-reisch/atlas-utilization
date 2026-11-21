@@ -3,18 +3,20 @@
 # Slurm Job Submission Script for ATLAS Pipeline (Baobab, UNIGE)
 # (ported from the Green Planet / UCI version)
 #
-# 4-phase batch/array architecture (see pipeline/executor.py module docstring
-# for the general design; this script is the Slurm implementation of it):
+# 4-phase chain, mirroring upstream submit_mc.sh (Slurm instead of PBS):
 #
-#   1. batch array   : each array task runs parsing + mass_calculating +
-#                       post_processing on its own slice of files, capped at
-#                       FILES_PER_JOB files -- a FRESH process per task.
-#   2. scan          : single job, after ALL batch tasks succeed --
-#                       writes logs/global_ranges.json
-#   3. histogram array: each array task builds histograms for its slice of
-#                       processed SQLite shards -> histograms/batch_N.root
-#   4. merge         : single job, after ALL histogram tasks succeed --
-#                       hadd's batch_N.root files, aggregates stats, plots
+#   1. batch array   : each array task runs parsing + mass_calculating on its
+#                       own slice of files, capped at FILES_PER_JOB files --
+#                       a FRESH process per task -> im_arrays/im_batch_N.sqlite
+#   2. post-process  : single job, after ALL batch tasks succeed. It must see
+#                       every IM shard: final states below min_events_per_fs
+#                       are pruned on the GLOBAL count across all shards.
+#                       -> im_arrays_processed/processed_batch_1.sqlite
+#   3. histograms    : single job (there is one processed shard)
+#                       -> histograms/batch_1.root
+#   4. merge         : hadd histograms/batch_*.root, aggregate stats, plots
+#
+# Histogram ranges are fixed ([0, 10] TeV), so there is no scan step anymore.
 #
 # WHY an array instead of one big job: a single long-lived process was
 # observed to accumulate memory well beyond what EventAccumulator tracks
@@ -50,8 +52,9 @@ MAX_CONCURRENT=${MAX_CONCURRENT:-20}  # throttle: at most this many array tasks 
 CPUS_PER_JOB=4
 BATCH_MEM="16G"
 BATCH_WALLTIME="12:00:00"     # shared-cpu max is 12h
-SCAN_WALLTIME="01:00:00"
-HIST_WALLTIME="01:00:00"
+POSTPROC_WALLTIME="04:00:00"
+POSTPROC_MEM="32G"
+HIST_WALLTIME="04:00:00"
 MERGE_WALLTIME="02:00:00"
 PARTITION="${PARTITION:-shared-cpu}"
 
@@ -120,7 +123,7 @@ echo "CPUs/job:      ${CPUS_PER_JOB}"
 echo "Mem/batch job: ${BATCH_MEM}"
 echo "=============================================="
 
-# --- Phase 1: batch array — parsing + mass_calculating + post_processing ---
+# --- Phase 1: batch array — parsing + mass_calculating ----------------------
 BATCH_JOB_ID=$(sbatch --parsable --array=1-${NUM_JOBS}%${MAX_CONCURRENT} <<EOF
 #!/bin/bash
 #SBATCH --job-name=atlas_batch
@@ -145,53 +148,25 @@ export SQLITE_JOURNAL_MODE=DELETE   # WAL readers hang on BeeGFS
 
 python -u main.py --config "${RUN_CONFIG}" --run-dir "${RUN_DIR}" \
     --batch-job-index \${SLURM_ARRAY_TASK_ID} --total-batch-jobs ${NUM_JOBS} \
-    --tasks parsing,mass_calculating,post_processing
+    --tasks parsing,mass_calculating
 EOF
 )
-echo "Submitted batch array:    ${BATCH_JOB_ID} (${NUM_JOBS} tasks)"
+echo "Submitted batch array:     ${BATCH_JOB_ID} (${NUM_JOBS} tasks)"
 
-# --- Phase 2: scan-only (writes logs/global_ranges.json) -------------------
-SCAN_JOB_ID=$(sbatch --parsable --dependency=afterok:${BATCH_JOB_ID} <<EOF
+# --- Phase 2: post-processing over ALL IM shards ---------------------------
+POSTPROC_JOB_ID=$(sbatch --parsable --dependency=afterok:${BATCH_JOB_ID} <<EOF
 #!/bin/bash
-#SBATCH --job-name=atlas_scan
+#SBATCH --job-name=atlas_postproc
 #SBATCH --partition=${PARTITION}
 ${ACCOUNT_DIRECTIVE}
 ${EXCLUDE_DIRECTIVE}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=${CPUS_PER_JOB}
-#SBATCH --mem=${BATCH_MEM}
-#SBATCH --time=${SCAN_WALLTIME}
-#SBATCH --output=${LOG_DIR}/scan.out
-#SBATCH --error=${LOG_DIR}/scan.err
-
-cd ${PIPELINE_DIR}
-
-export ATLAS_LOCAL_ROOT_BASE=/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase
-source \${ATLAS_LOCAL_ROOT_BASE}/user/atlasLocalSetup.sh
-lsetup "views LCG_107 x86_64-el9-gcc14-opt"
-export PYTHONUSERBASE=${PY_USERBASE}
-export SQLITE_JOURNAL_MODE=DELETE   # WAL readers hang on BeeGFS
-
-python -u main.py --config "${RUN_CONFIG}" --run-dir "${RUN_DIR}" --scan-only
-EOF
-)
-echo "Submitted scan job:       ${SCAN_JOB_ID} (depends on ${BATCH_JOB_ID})"
-
-# --- Phase 3: histogram array ------------------------------------------------
-HIST_JOB_ID=$(sbatch --parsable --array=1-${NUM_JOBS}%${MAX_CONCURRENT} --dependency=afterok:${SCAN_JOB_ID} <<EOF
-#!/bin/bash
-#SBATCH --job-name=atlas_hist
-#SBATCH --partition=${PARTITION}
-${ACCOUNT_DIRECTIVE}
-${EXCLUDE_DIRECTIVE}
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=${CPUS_PER_JOB}
-#SBATCH --mem=${BATCH_MEM}
-#SBATCH --time=${HIST_WALLTIME}
-#SBATCH --output=${LOG_DIR}/hist_%a.out
-#SBATCH --error=${LOG_DIR}/hist_%a.err
+#SBATCH --mem=${POSTPROC_MEM}
+#SBATCH --time=${POSTPROC_WALLTIME}
+#SBATCH --output=${LOG_DIR}/postproc.out
+#SBATCH --error=${LOG_DIR}/postproc.err
 
 cd ${PIPELINE_DIR}
 
@@ -202,11 +177,40 @@ export PYTHONUSERBASE=${PY_USERBASE}
 export SQLITE_JOURNAL_MODE=DELETE   # WAL readers hang on BeeGFS
 
 python -u main.py --config "${RUN_CONFIG}" --run-dir "${RUN_DIR}" \
-    --batch-job-index \${SLURM_ARRAY_TASK_ID} --total-batch-jobs ${NUM_JOBS} \
+    --tasks post_processing
+EOF
+)
+echo "Submitted post-processing: ${POSTPROC_JOB_ID} (depends on ${BATCH_JOB_ID})"
+
+# --- Phase 3: histogram creation (one processed shard -> one job) -----------
+HIST_JOB_ID=$(sbatch --parsable --dependency=afterok:${POSTPROC_JOB_ID} <<EOF
+#!/bin/bash
+#SBATCH --job-name=atlas_hist
+#SBATCH --partition=${PARTITION}
+${ACCOUNT_DIRECTIVE}
+${EXCLUDE_DIRECTIVE}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=${CPUS_PER_JOB}
+#SBATCH --mem=${BATCH_MEM}
+#SBATCH --time=${HIST_WALLTIME}
+#SBATCH --output=${LOG_DIR}/hist.out
+#SBATCH --error=${LOG_DIR}/hist.err
+
+cd ${PIPELINE_DIR}
+
+export ATLAS_LOCAL_ROOT_BASE=/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase
+source \${ATLAS_LOCAL_ROOT_BASE}/user/atlasLocalSetup.sh
+lsetup "views LCG_107 x86_64-el9-gcc14-opt"
+export PYTHONUSERBASE=${PY_USERBASE}
+export SQLITE_JOURNAL_MODE=DELETE   # WAL readers hang on BeeGFS
+
+python -u main.py --config "${RUN_CONFIG}" --run-dir "${RUN_DIR}" \
+    --batch-job-index 1 --total-batch-jobs 1 \
     --tasks histogram_creation
 EOF
 )
-echo "Submitted histogram array: ${HIST_JOB_ID} (${NUM_JOBS} tasks, depends on ${SCAN_JOB_ID})"
+echo "Submitted histogram job:   ${HIST_JOB_ID} (depends on ${POSTPROC_JOB_ID})"
 
 # --- Phase 4: merge — hadd histograms + aggregate stats + plots -------------
 MERGE_JOB_ID=$(sbatch --parsable --dependency=afterok:${HIST_JOB_ID} <<EOF
@@ -234,10 +238,10 @@ export SQLITE_JOURNAL_MODE=DELETE   # WAL readers hang on BeeGFS
 python -u main.py --config "${RUN_CONFIG}" --run-dir "${RUN_DIR}" --merge-only
 EOF
 )
-echo "Submitted merge job:      ${MERGE_JOB_ID} (depends on ${HIST_JOB_ID})"
+echo "Submitted merge job:       ${MERGE_JOB_ID} (depends on ${HIST_JOB_ID})"
 
 echo ""
 echo "Monitor:  squeue -u \$USER"
-echo "Cancel:   scancel ${BATCH_JOB_ID} ${SCAN_JOB_ID} ${HIST_JOB_ID} ${MERGE_JOB_ID}"
+echo "Cancel:   scancel ${BATCH_JOB_ID} ${POSTPROC_JOB_ID} ${HIST_JOB_ID} ${MERGE_JOB_ID}"
 echo "Logs:     ${LOG_DIR}/"
 echo "Output:   ${RUN_DIR}/"
