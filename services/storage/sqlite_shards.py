@@ -25,7 +25,11 @@ class SqliteArrayShardWriter:
         self.table_name = table_name
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        # WAL needs shared-memory (-shm) locking that some network/parallel
+        # filesystems (e.g. BeeGFS) don't support: readers of a WAL db can hang
+        # there. Set SQLITE_JOURNAL_MODE=DELETE on such clusters.
+        journal_mode = os.environ.get("SQLITE_JOURNAL_MODE", "WAL")
+        self.conn.execute(f"PRAGMA journal_mode={journal_mode};")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.execute("PRAGMA temp_store=MEMORY;")
         self.conn.execute(

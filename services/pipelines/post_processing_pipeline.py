@@ -178,7 +178,12 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
 
     batch_idx = config.get("batch_job_index")
     if batch_idx is not None:
-        sqlite_files = [f for f in sqlite_files if f"batch_{batch_idx}" in f]
+        # Exact match: a substring test would let batch 1 also take
+        # im_batch_10..19.sqlite and double-count them.
+        sqlite_files = [
+            f for f in sqlite_files
+            if os.path.basename(f) == f"im_batch_{batch_idx}.sqlite"
+        ]
     if batch_idx is None:
         # Fall back to parsing from shard names like im_batch_3.sqlite
         for f in sqlite_files:
