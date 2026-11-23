@@ -40,6 +40,8 @@ class HistogramCreationHandler(StateHandler):
             "use_bumpnet_naming": hc.use_bumpnet_naming,
             "apply_peak_removal_at_histogram_level": hc.apply_peak_removal_at_histogram_level,
             "trim_empty_bins": hc.trim_empty_bins,
+            "resolution_profile_bin_width_gev": hc.resolution_profile_bin_width_gev,
+            "process_groups": hc.process_groups,
             "batch_job_index": context.config.batch_job_index,
             "total_batch_jobs": context.config.total_batch_jobs,
         }

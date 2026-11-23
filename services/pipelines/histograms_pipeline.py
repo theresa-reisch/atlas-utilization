@@ -15,13 +15,22 @@ from collections import defaultdict
 import numpy as np
 import ROOT
 import math
-from services.pipelines.im_pipeline import MC_WEIGHT_SUFFIX
+from services.pipelines.im_pipeline import (
+    MC_WEIGHT_SUFFIX, SIGMA_SUFFIX, DSID_SUFFIX, is_sibling_signature,
+)
 from services.storage.sqlite_shards import list_signatures, iter_arrays_for_signature
 
 # Fixed histogram range eliminates the range pre-scan and ensures that all
 # independently produced batch histograms have merge-compatible bin edges.
 FIXED_MASS_MIN_GEV = 0.0
 FIXED_MASS_MAX_GEV = 10000.0
+
+# Companion objects written next to each mass histogram ROI_<base>_width_<w>
+# for the post-merge resolution rebinning (services/pipelines/rebin_pipeline.py):
+#   RESO_<base>                  TProfile of the per-event sigma_m vs mass
+#   PROC_<group>_<base>_width_<w> mass histogram of one process group (MC only)
+RESOLUTION_PROFILE_PREFIX = "RESO_"
+PROCESS_HIST_PREFIX = "PROC_"
 
 
 def _bin_is_empty(hist: ROOT.TH1, b: int) -> bool:
@@ -36,6 +45,9 @@ def slice_empty_bins(hist: ROOT.TH1) -> ROOT.TH1:
     stay on the original grid, so bin width is unchanged. Interior empty
     bins are kept. An all-empty histogram is returned as is.
     """
+    if hist.InheritsFrom("TProfile"):
+        # A profile stores sums per bin; copying contents would corrupt it.
+        return hist
     nbins = hist.GetNbinsX()
     filled = [b for b in range(1, nbins + 1) if not _bin_is_empty(hist, b)]
     if not filled:
@@ -113,16 +125,91 @@ def _fill_mass(hist: ROOT.TH1, value: float, weight: float = 1.0) -> None:
     hist.Fill(mass, weight)
 
 
+def _clip_to_range(masses) -> np.ndarray:
+    """Masses as float64, the declared upper endpoint moved just inside the range."""
+    x = np.asarray(masses, dtype=np.float64)
+    return np.where(x == FIXED_MASS_MAX_GEV, math.nextafter(FIXED_MASS_MAX_GEV, FIXED_MASS_MIN_GEV), x)
+
+
+class _HistogramSet:
+    """
+    The histograms of one output name: the mass histogram per bin width plus,
+    when requested, the sigma_m profile and the per-process-group histograms.
+
+    ``process_groups`` maps a group name to the DSIDs in it. Process-group
+    histograms are only made when the events carry DSIDs (MC).
+    """
+
+    def __init__(self, base_name: str, bin_widths_gev: List[float], weighted: bool,
+                 profile_bin_width_gev: Optional[float] = None,
+                 process_groups: Optional[Dict[str, List[int]]] = None):
+        self.base_name = base_name
+        self.bin_widths_gev = list(bin_widths_gev)
+        self.mass = [
+            _new_histogram(f"ROI_{base_name}_width_{w}", _nbins(w), weighted)
+            for w in self.bin_widths_gev
+        ]
+        self.profile = None
+        if profile_bin_width_gev:
+            name = f"{RESOLUTION_PROFILE_PREFIX}{base_name}"
+            self.profile = ROOT.TProfile(
+                name, name, _nbins(profile_bin_width_gev), FIXED_MASS_MIN_GEV, FIXED_MASS_MAX_GEV
+            )
+            self.profile.SetDirectory(0)
+        self.groups = {
+            g: np.asarray(sorted(int(d) for d in dsids), dtype=np.int64)
+            for g, dsids in (process_groups or {}).items()
+        }
+        self.process: Dict[str, List[ROOT.TH1]] = {}
+        self.has_data = False
+
+    def fill(self, masses, weights=None, sigmas=None, dsids=None) -> None:
+        if len(masses) == 0:
+            return
+        self.has_data = True
+        _fill_chunk(self.mass, masses, weights)
+        x = _clip_to_range(masses)
+        w = np.ones(len(x)) if weights is None else np.asarray(weights, dtype=np.float64)
+        if self.profile is not None and sigmas is not None:
+            # |w|: the profile is the mean sigma_m at a given mass; negative
+            # generator weights would only make that mean unstable.
+            self.profile.FillN(len(x), x, np.asarray(sigmas, dtype=np.float64), np.abs(w))
+        if dsids is not None:
+            dsids = np.asarray(dsids, dtype=np.int64)
+            for group, members in self.groups.items():
+                sel = np.isin(dsids, members)
+                if not sel.any():
+                    continue
+                if group not in self.process:
+                    self.process[group] = [
+                        _new_histogram(f"{PROCESS_HIST_PREFIX}{group}_{self.base_name}_width_{bw}",
+                                       _nbins(bw), True)
+                        for bw in self.bin_widths_gev
+                    ]
+                for hist in self.process[group]:
+                    hist.FillN(int(sel.sum()), x[sel], w[sel])
+
+    def all_histograms(self) -> List[ROOT.TH1]:
+        out = list(self.mass)
+        if self.profile is not None and self.profile.GetEntries() > 0:
+            out.append(self.profile)
+        for hists in self.process.values():
+            out.extend(hists)
+        return out
+
+
+def _nbins(bin_width: float) -> int:
+    return max(1, math.ceil((FIXED_MASS_MAX_GEV - FIXED_MASS_MIN_GEV) / bin_width))
+
+
 def _fill_chunk(histograms: List[ROOT.TH1], masses, weights=None) -> None:
     """Fill every histogram with a chunk of masses and, when given, their per-event MC weights."""
-    if weights is None:
-        for hist in histograms:
-            for val in masses:
-                _fill_mass(hist, val)
+    x = _clip_to_range(masses)
+    if len(x) == 0:
         return
+    w = np.ones(len(x)) if weights is None else np.asarray(weights, dtype=np.float64)
     for hist in histograms:
-        for val, weight in zip(masses, weights):
-            _fill_mass(hist, val, float(weight))
+        hist.FillN(len(x), x, w)
 
 
 def create_histograms(histograms_config: Dict, file_list: Optional[List[str]] = None):
@@ -260,6 +347,10 @@ def _create_histograms_from_sqlite(
     exclude_outliers = histograms_config.get("exclude_outliers", False)
     single_output_file = histograms_config.get("single_output_file", False)
     output_filename = histograms_config.get("output_filename", "all_histograms.root")
+    extras = {
+        "profile_bin_width_gev": histograms_config.get("resolution_profile_bin_width_gev"),
+        "process_groups": histograms_config.get("process_groups"),
+    }
 
     db_paths = [os.path.join(input_dir, f) for f in sqlite_files]
 
@@ -284,11 +375,11 @@ def _create_histograms_from_sqlite(
         signatures.update(list_signatures(db_path))
     signatures = sorted(signatures)
 
-    # Per-event MC weight arrays are consumed as siblings during the fill;
-    # they are never histogrammed as data. Their presence turns on Sumw2 so
-    # bin errors are weighted errors.
+    # Per-event sibling arrays (MC weights, sigma_m, DSID) are consumed during
+    # the fill; they are never histogrammed as data. MC weights turn on Sumw2
+    # so bin errors are weighted errors.
     weighted = any(s.endswith(MC_WEIGHT_SUFFIX) for s in signatures)
-    signatures = [s for s in signatures if not s.endswith(MC_WEIGHT_SUFFIX)]
+    signatures = [s for s in signatures if not is_sibling_signature(s)]
     if weighted:
         logger.info("MC event weights present: filling weighted histograms with Sumw2")
 
@@ -313,7 +404,7 @@ def _create_histograms_from_sqlite(
             for bumpnet_name, group_sigs in grouped.items():
                 hists = _create_merged_histograms_from_sqlite_signatures(
                     group_sigs, db_paths, bumpnet_name, bin_widths_gev, logger,
-                    weighted=weighted,
+                    weighted=weighted, **extras,
                 )
                 if hists:
                     if trim_before_write:
@@ -325,7 +416,7 @@ def _create_histograms_from_sqlite(
             for bumpnet_name, group_sigs in grouped.items():
                 hists = _create_merged_histograms_from_sqlite_signatures(
                     group_sigs, db_paths, bumpnet_name, bin_widths_gev, logger,
-                    weighted=weighted,
+                    weighted=weighted, **extras,
                 )
                 if hists:
                     if trim_before_write:
@@ -343,7 +434,7 @@ def _create_histograms_from_sqlite(
             for signature in signatures:
                 hists = _create_histograms_for_signature(
                     signature, db_paths, bin_widths_gev, logger, apply_peak_removal,
-                    weighted=weighted,
+                    weighted=weighted, **extras,
                 )
                 if hists:
                     if trim_before_write:
@@ -355,7 +446,7 @@ def _create_histograms_from_sqlite(
             for signature in signatures:
                 hists = _create_histograms_for_signature(
                     signature, db_paths, bin_widths_gev, logger, apply_peak_removal,
-                    weighted=weighted,
+                    weighted=weighted, **extras,
                 )
                 if hists:
                     if trim_before_write:
@@ -390,28 +481,29 @@ def _group_signatures_by_bumpnet(signatures: List[str]) -> Dict[str, List[str]]:
 
 def _iter_weighted_signature_chunks(signature: str, db_paths: List[str], logger: logging.Logger):
     """
-    Yield ``(masses, weights)`` per stored chunk of ``signature``.
+    Yield ``(masses, weights, sigmas, dsids)`` per stored chunk of ``signature``.
 
-    ``weights`` is the aligned chunk of the ``_mcw`` sibling signature, or None
-    when the signature has no per-event MC weights. A sibling that does not
-    line up chunk-for-chunk is ignored (with a warning) rather than misapplied.
+    The last three are the aligned chunks of the ``_mcw``, ``_sigm`` and
+    ``_dsid`` sibling signatures, or None when the signature has no such
+    sibling. A sibling that does not line up chunk-for-chunk is ignored (with
+    a warning) rather than misapplied.
     """
     for db_path in db_paths:
         chunks = [a for a in iter_arrays_for_signature(db_path, signature) if len(a) > 0]
-        weights = [
-            a for a in iter_arrays_for_signature(db_path, signature + MC_WEIGHT_SUFFIX)
-            if len(a) > 0
-        ]
-        aligned = bool(weights) and len(weights) == len(chunks) and all(
-            len(w) == len(c) for w, c in zip(weights, chunks)
-        )
-        if weights and not aligned:
-            logger.warning(
-                f"{signature}: MC weights in {os.path.basename(db_path)} do not align "
-                "with the masses; filling unweighted"
+        siblings = []
+        for suffix in (MC_WEIGHT_SUFFIX, SIGMA_SUFFIX, DSID_SUFFIX):
+            sib = [a for a in iter_arrays_for_signature(db_path, signature + suffix) if len(a) > 0]
+            aligned = bool(sib) and len(sib) == len(chunks) and all(
+                len(w) == len(c) for w, c in zip(sib, chunks)
             )
+            if sib and not aligned:
+                logger.warning(
+                    f"{signature}: {suffix} in {os.path.basename(db_path)} does not align "
+                    "with the masses; ignoring it"
+                )
+            siblings.append(sib if aligned else None)
         for i, chunk in enumerate(chunks):
-            yield chunk, (weights[i] if aligned else None)
+            yield (chunk, *(sib[i] if sib is not None else None for sib in siblings))
 
 
 def _create_histograms_for_signature(
@@ -421,26 +513,22 @@ def _create_histograms_for_signature(
     logger: logging.Logger,
     apply_peak_removal: bool = False,
     weighted: bool = False,
-) -> List[ROOT.TH1F]:
-    histograms = []
-    for bin_width in bin_widths_gev:
-        nbins = max(1, math.ceil((FIXED_MASS_MAX_GEV - FIXED_MASS_MIN_GEV) / bin_width))
-        hist_name = f"ROI_{signature}_width_{bin_width}"
-        histograms.append(_new_histogram(hist_name, nbins, weighted))
+    profile_bin_width_gev: Optional[float] = None,
+    process_groups: Optional[Dict[str, List[int]]] = None,
+) -> List[ROOT.TH1]:
+    hset = _HistogramSet(signature, bin_widths_gev, weighted,
+                         profile_bin_width_gev, process_groups)
+    for chunk, weights, sigmas, dsids in _iter_weighted_signature_chunks(signature, db_paths, logger):
+        hset.fill(chunk, weights, sigmas, dsids)
 
-    has_data = False
-    for chunk, weights in _iter_weighted_signature_chunks(signature, db_paths, logger):
-        has_data = True
-        _fill_chunk(histograms, chunk, weights)
-
-    if not has_data:
+    if not hset.has_data:
         return []
 
     if apply_peak_removal:
-        for hist in histograms:
+        for hist in hset.mass:
             _apply_peak_removal_to_histogram(hist)
 
-    return histograms
+    return hset.all_histograms()
 
 
 def _create_merged_histograms_from_sqlite_signatures(
@@ -451,32 +539,28 @@ def _create_merged_histograms_from_sqlite_signatures(
     logger: logging.Logger,
     apply_peak_removal: bool = False,
     weighted: bool = False,
-) -> List[ROOT.TH1F]:
+    profile_bin_width_gev: Optional[float] = None,
+    process_groups: Optional[Dict[str, List[int]]] = None,
+) -> List[ROOT.TH1]:
     if 'cat' not in hist_name_base and 'hCat' not in hist_name_base:
         raise ValueError(
             f"Invalid histogram name base '{hist_name_base}': must contain 'cat'"
         )
 
-    histograms = []
-    for bin_width in bin_widths_gev:
-        nbins = max(1, math.ceil((FIXED_MASS_MAX_GEV - FIXED_MASS_MIN_GEV) / bin_width))
-        hist_name = f"ROI_{hist_name_base}_width_{bin_width}"
-        histograms.append(_new_histogram(hist_name, nbins, weighted))
-
-    has_data = False
+    hset = _HistogramSet(hist_name_base, bin_widths_gev, weighted,
+                         profile_bin_width_gev, process_groups)
     for signature in signatures:
-        for chunk, weights in _iter_weighted_signature_chunks(signature, db_paths, logger):
-            has_data = True
-            _fill_chunk(histograms, chunk, weights)
+        for chunk, weights, sigmas, dsids in _iter_weighted_signature_chunks(signature, db_paths, logger):
+            hset.fill(chunk, weights, sigmas, dsids)
 
-    if not has_data:
+    if not hset.has_data:
         return []
 
     if apply_peak_removal:
-        for hist in histograms:
+        for hist in hset.mass:
             _apply_peak_removal_to_histogram(hist)
 
-    return histograms
+    return hset.all_histograms()
 
 def _group_im_files_by_signature(im_files: List[str]) -> Dict[str, List[str]]:
     groups = defaultdict(list)

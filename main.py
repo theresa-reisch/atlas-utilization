@@ -119,6 +119,10 @@ def parse_args():
         "--plots-only", action="store_true",
         help="Only generate plots from existing data in --run-dir (no pipeline execution)"
     )
+    post_group.add_argument(
+        "--rebin-only", action="store_true",
+        help="Only run the resolution rebinning (rebin_config) on the merged histograms in --run-dir"
+    )
 
     args = parser.parse_args()
 
@@ -127,10 +131,10 @@ def parse_args():
         parser.error("--total-batch-jobs is required when --batch-job-index is set")
     if args.total_batch_jobs is not None and args.batch_job_index is None:
         parser.error("--batch-job-index is required when --total-batch-jobs is set")
-    if (args.plots_only or args.merge_only) and args.run_dir is None:
-        parser.error("--run-dir is required when --plots-only or --merge-only is set")
-    if args.plots_only and args.merge_only:
-        parser.error("--plots-only and --merge-only are mutually exclusive")
+    if (args.plots_only or args.merge_only or args.rebin_only) and args.run_dir is None:
+        parser.error("--run-dir is required when --plots-only, --merge-only or --rebin-only is set")
+    if sum([args.plots_only, args.merge_only, args.rebin_only]) > 1:
+        parser.error("--plots-only, --merge-only and --rebin-only are mutually exclusive")
     return args
 
 
@@ -162,6 +166,18 @@ def main():
         # ------------------------------------------------------------------
         # MERGE-ONLY MODE: hadd histograms + aggregate stats + plots
         # ------------------------------------------------------------------
+        if args.rebin_only:
+            logger.info(f"Rebin-only mode: rebinning histograms in {args.run_dir}")
+            config_dict = load_config(args.config)
+            config_dict = update_config_paths_with_run_dir(config_dict, args.run_dir)
+            config = PipelineConfig.from_dict(config_dict)
+            if not (config.rebin_config and config.rebin_config.enabled):
+                logger.error("--rebin-only needs rebin_config.enabled: true")
+                return 1
+            PipelineExecutor(config).rebin_outputs(args.run_dir)
+            logger.info("✓ Rebinning completed successfully")
+            return 0
+
         if args.merge_only:
             logger.info(f"Merge-only mode: merging outputs in {args.run_dir}")
             config_dict = load_config(args.config)
@@ -253,6 +269,8 @@ def main():
 
         # Generate plots only for single-job runs (batch plots are deferred to merge)
         if config.batch_job_index is None:
+            if config.rebin_config and config.rebin_config.enabled and final_context.is_successful:
+                executor.rebin_outputs(run_dir)
             executor.generate_plots_from_output(run_dir)
 
         if final_context.is_successful:

@@ -39,7 +39,7 @@ from services.parsing.file_parser import FileParser
 from services.parsing.event_accumulator import EventAccumulator
 from services.parsing.threaded_processor import ThreadedFileProcessor
 from services.analysis.statistics_plotter import StatisticsPlotter
-from services.pipelines.im_pipeline import MC_WEIGHT_SUFFIX
+from services.pipelines.im_pipeline import is_sibling_signature
 from services.storage.sqlite_shards import get_total_entries
 
 
@@ -164,6 +164,32 @@ class PipelineExecutor:
             self.logger.info(f"Saved {stage} statistics to: {stats_path}")
 
 
+    def rebin_outputs(self, run_dir: str):
+        """Resolution rebinning of the merged histogram file (rebin_config)."""
+        from services.pipelines.rebin_pipeline import RebinSettings, rebin_file
+
+        rc = self.config.rebin_config
+        hc = self.config.histogram_creation_config
+        merged_name = hc.output_filename if hc and hc.output_filename else "atlas_opendata.root"
+        merged_path = os.path.join(run_dir, "histograms", merged_name)
+        if not os.path.exists(merged_path):
+            self.logger.warning(f"No merged histogram file {merged_path}; skipping rebinning")
+            return None
+        settings = RebinSettings(
+            mode=rc.mode,
+            base_bin_width_gev=rc.base_bin_width_gev,
+            binning_dir=rc.binning_dir or os.path.join(run_dir, "rebin"),
+            output_filename=rc.output_filename,
+            rho=rc.rho,
+            gpr_alpha_floor=rc.gpr_alpha_floor,
+            min_profile_entries=rc.min_profile_entries,
+            z_veto_edge_gev=rc.z_veto_edge_gev,
+            top_roi_start_gev=rc.top_roi_start_gev,
+            ztautau_cutoff_gev=rc.ztautau_cutoff_gev,
+        )
+        self.logger.info(f"Resolution rebinning ({rc.mode}) of {merged_path}")
+        return rebin_file(merged_path, settings)
+
     def merge_outputs(self, run_dir: str):
         """
         Merge outputs from all batch jobs:
@@ -228,6 +254,10 @@ class PipelineExecutor:
             self.logger.info("No batch_*.root files found in histograms/ – skipping hadd")
 
         
+        # ---- 1a. Resolution rebinning of the merged histograms ----
+        if self.config.rebin_config and self.config.rebin_config.enabled:
+            self.rebin_outputs(run_dir)
+
         # ---- 1b. Optionally also produce pre-postproc histograms ----
         hc = self.config.histogram_creation_config
         if hc and getattr(hc, 'also_save_pre_postproc', False):
@@ -520,8 +550,8 @@ class PipelineExecutor:
                                     f"Invalid mass calculation timing in {sf}: {timing_row[0]!r}"
                                 )
 
-                # Per-event MC weight rows mirror their IM rows; not physics entries.
-                rows = [r for r in rows if not r[0].endswith(MC_WEIGHT_SUFFIX)]
+                # Sibling rows (weights, sigma_m, DSID) mirror their IM rows; not physics entries.
+                rows = [r for r in rows if not is_sibling_signature(r[0])]
                 total_signatures += len(rows)
                 for signature, entries in rows:
                     entries = int(entries or 0)
@@ -665,7 +695,7 @@ class PipelineExecutor:
                         GROUP BY signature
                         """
                     ).fetchall()
-                rows = [r for r in rows if not r[0].endswith(MC_WEIGHT_SUFFIX)]
+                rows = [r for r in rows if not is_sibling_signature(r[0])]
                 total_signatures += len(rows)
                 for signature, entries in rows:
                     entries = int(entries or 0)

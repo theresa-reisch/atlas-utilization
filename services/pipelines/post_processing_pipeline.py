@@ -15,7 +15,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-from services.pipelines.im_pipeline import MC_WEIGHT_SUFFIX
+from services.pipelines.im_pipeline import MC_WEIGHT_SUFFIX, SIBLING_SUFFIXES, is_sibling_signature
 from services.storage.sqlite_shards import (
     SqliteArrayShardWriter,
     iter_arrays_for_signature,
@@ -223,24 +223,23 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
     processed = 0
     try:
         for fs_im_key in sorted(fs_im_groups.keys()):
-            # Per-event MC weight arrays are processed as siblings of their
-            # physics signature below, never as signatures in their own right.
-            if fs_im_key.endswith(MC_WEIGHT_SUFFIX):
+            # Per-event sibling arrays (MC weights, sigma_m, DSID) are processed
+            # together with their physics signature below, never on their own.
+            if is_sibling_signature(fs_im_key):
                 continue
 
             chunk_sigs = fs_im_groups[fs_im_key]
             chunks = []
-            weight_chunks = []
+            sibling_chunks = {suffix: [] for suffix in SIBLING_SUFFIXES}
             for sig in chunk_sigs:
                 for filename in sqlite_files:
                     db_path = os.path.join(input_dir, filename)
                     sig_chunks = list(iter_arrays_for_signature(db_path, sig))
                     chunks.extend(sig_chunks)
-                    # Gather the parallel weights in the SAME order so that
-                    # mass[i] and weight[i] stay aligned through every step.
-                    weight_chunks.extend(
-                        iter_arrays_for_signature(db_path, sig + MC_WEIGHT_SUFFIX)
-                    )
+                    # Gather the siblings in the SAME order so that mass[i]
+                    # and sibling[i] stay aligned through every step.
+                    for suffix, sib in sibling_chunks.items():
+                        sib.extend(iter_arrays_for_signature(db_path, sig + suffix))
             if not chunks:
                 continue
 
@@ -248,24 +247,26 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             if len(arr) == 0:
                 continue
 
-            warr = None
-            if weight_chunks:
-                warr = np.concatenate(weight_chunks) if len(weight_chunks) > 1 else weight_chunks[0]
-                if len(warr) != len(arr):
+            siblings = {}
+            for suffix, sib in sibling_chunks.items():
+                if not sib:
+                    continue
+                sarr = np.concatenate(sib) if len(sib) > 1 else sib[0]
+                if len(sarr) != len(arr):
                     logger.warning(
-                        f"{fs_im_key}: {len(warr)} MC weights for {len(arr)} masses; "
-                        "alignment lost, writing it unweighted"
+                        f"{fs_im_key}: {len(sarr)} {suffix} entries for {len(arr)} masses; "
+                        f"alignment lost, dropping {suffix}"
                     )
-                    warr = None
+                    continue
+                siblings[suffix] = sarr
 
             # Every step is a boolean mask on the mass array, applied to the
-            # weights as well so both stay aligned.
+            # siblings as well so all stay aligned.
             keep = _z_peak_mask(arr, fs_im_key, z_peak_cutoff, logger)
             if max_mass_cutoff > 0:
                 keep &= arr <= max_mass_cutoff
             arr = arr[keep]
-            if warr is not None:
-                warr = warr[keep]
+            siblings = {k: v[keep] for k, v in siblings.items()}
             if len(arr) == 0:
                 continue
 
@@ -273,14 +274,15 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             # that is the distribution BumpNet will see, and for sliced samples
             # the raw-count maximum sits where the tiny-weight slice piles up.
             peak_mass = (
-                _find_rightmost_highest_peak(arr, bin_width, logger, weights=warr)
+                _find_rightmost_highest_peak(
+                    arr, bin_width, logger, weights=siblings.get(MC_WEIGHT_SUFFIX)
+                )
                 if enable_peak_removal else None
             )
             if peak_mass is not None:
                 keep = arr >= peak_mass
                 arr = arr[keep]
-                if warr is not None:
-                    warr = warr[keep]
+                siblings = {k: v[keep] for k, v in siblings.items()}
             if len(arr) == 0:
                 continue
 
@@ -289,13 +291,13 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             if len(main_array) > 0:
                 writer.append_array(f"{fs_im_key}_main", main_array)
                 written += 1
-                if warr is not None:
-                    writer.append_array(f"{fs_im_key}_main{MC_WEIGHT_SUFFIX}", warr[main_mask])
+                for suffix, sarr in siblings.items():
+                    writer.append_array(f"{fs_im_key}_main{suffix}", sarr[main_mask])
             if len(outliers_array) > 0:
                 writer.append_array(f"{fs_im_key}_outliers", outliers_array)
                 written += 1
-                if warr is not None:
-                    writer.append_array(f"{fs_im_key}_outliers{MC_WEIGHT_SUFFIX}", warr[~main_mask])
+                for suffix, sarr in siblings.items():
+                    writer.append_array(f"{fs_im_key}_outliers{suffix}", sarr[~main_mask])
 
             processed += 1                          # ← new
             if processed % COMMIT_EVERY == 0:       # ← new

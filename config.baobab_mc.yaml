@@ -181,6 +181,14 @@ mass_calculation_task_config:
   include_subleading: true        # set true to include e1, j1, etc.
   max_subleading_index: 1          # highest rank index to consider
 
+  # ===MASS RESOLUTION===
+  # Per-event sigma_m from public per-object pT resolutions (Open Data MC truth,
+  # data/MC scale from the Z peak); stored next to each mass as the _sigm sibling.
+  mass_resolution:
+    enabled: true
+    table: null                          # null = resources/resolution/object_resolution_2024r-pp_v1.json
+    apply_data_mc_scale: true
+
 # --- 3. Post-Processing ------------------------------------------------------
 # Removes known-mass peaks and splits into main / outlier arrays.
 post_processing_task_config:
@@ -202,7 +210,7 @@ histogram_creation_task_config:
   output_dir: *histograms_path
 
   # ===PROCESSING===
-  bin_width_gev: 10.0
+  bin_width_gev: 1.0                     # fine base grid for the resolution rebinning
 
   # ===OUTPUT===
   single_output_file: true
@@ -211,3 +219,27 @@ histogram_creation_task_config:
   use_bumpnet_naming: true               # mass_<combo>_cat_<final_state> format
   apply_peak_removal_at_histogram_level: false
   trim_empty_bins: false                 # slice each histogram to its first..last non-empty bin (after hadd in batch runs)
+
+  # ===RESOLUTION REBINNING INPUTS===
+  resolution_profile_bin_width_gev: 10.0   # RESO_ profile of sigma_m vs mass; null = off
+  process_groups:                        # PROC_<group>_ histograms for the rebin ROI overrides (MC only)
+    top:                                 # ttbar + single top (2024r-pp Open Data DSIDs)
+      [410470, 410471, 411233, 411234, 411316, 410644, 410645, 410658, 410659,
+       600017, 600018, 600019, 600020, 601352, 601355, 601624, 601627, 601628,
+       601631, 601761, 601762, 601763, 601764]
+    ztautau:                             # Sherpa Z -> tautau
+      [700360, 700792, 700793, 700794, 700901, 700902, 700903]
+
+# --- Resolution rebinning (after the merge) ----------------------------------
+# Mirrors WLCG rebinStackHistograms.py: bin width = sigma_m(m)/rho from a GPR
+# fit of the RESO_ profile; ROI from the maximum, ee/mumu above 106.18 GeV, top
+# (1l+1j) start >= 175 GeV, e+mu Z->tautau start at the maximum above 80 GeV.
+# Needs histograms with bin_width_gev = base_bin_width_gev.
+# Writes histograms/<output_filename> with rebinned_<name> and ROI_<name>.
+rebin_config:
+  enabled: true
+  mode: fit                              # fit: derive + save binning; cached: reuse binning_dir (e.g. data)
+  base_bin_width_gev: 1.0
+  binning_dir: null                      # null = <run_dir>/rebin
+  output_filename: rebinned.root
+  rho: 1.0                               # bin width = sigma_m / rho

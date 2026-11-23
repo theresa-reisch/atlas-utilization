@@ -5,7 +5,7 @@ Validated configuration objects for the pipeline.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -140,6 +140,12 @@ class MassCalculationConfig:
     min_events_per_fs: int = 100  # Minimum events for a final state to be kept
     include_subleading: bool = True        # include e1, j1, etc. by default
     max_subleading_index: int = 1          # highest rank index to consider
+
+    # Per-event mass resolution sigma_m (stored as the _sigm sibling) from a
+    # public object-resolution table; None table = the packaged default.
+    mass_resolution_enabled: bool = False
+    mass_resolution_table: Optional[str] = None
+    mass_resolution_apply_data_mc_scale: bool = True
     
     def __post_init__(self):
         """Validate mass calculation configuration."""
@@ -211,8 +217,8 @@ class HistogramCreationConfig:
     input_dir: str
     output_dir: str
     
-    # Processing parameters
-    bin_width_gev: float = 10.0
+    # Processing parameters (one width or a list of widths)
+    bin_width_gev: Union[float, Tuple[float, ...]] = 10.0
     single_output_file: bool = False
     output_filename: Optional[str] = None
     
@@ -227,16 +233,56 @@ class HistogramCreationConfig:
     also_save_pre_postproc: bool = False
     pre_postproc_filename: Optional[str] = None
 
+    # Inputs of the resolution rebinning: RESO_ profile of the per-event
+    # sigma_m (None = not filled) and PROC_<group>_ histograms per process
+    # group ({group: [DSID, ...]}; MC only).
+    resolution_profile_bin_width_gev: Optional[float] = None
+    process_groups: Optional[dict] = None
+
     def __post_init__(self):
         """Validate histogram creation configuration."""
         if not self.input_dir:
             raise ValueError("input_dir cannot be empty")
         if not self.output_dir:
             raise ValueError("output_dir cannot be empty")
-        if self.bin_width_gev <= 0:
+        widths = self.bin_width_gev if isinstance(self.bin_width_gev, tuple) else (self.bin_width_gev,)
+        if not widths or any(w <= 0 for w in widths):
             raise ValueError(f"bin_width_gev must be positive, got {self.bin_width_gev}")
+        if self.resolution_profile_bin_width_gev is not None and self.resolution_profile_bin_width_gev <= 0:
+            raise ValueError("resolution_profile_bin_width_gev must be positive")
         if self.single_output_file and not self.output_filename:
             raise ValueError("output_filename required when single_output_file=True")
+
+
+@dataclass(frozen=True)
+class RebinConfig:
+    """
+    Post-merge resolution rebinning (services/pipelines/rebin_pipeline.py).
+
+    ``fit`` derives the binning from the RESO_ profiles and saves it under
+    ``binning_dir``; ``cached`` reuses a saved binning (e.g. data with the
+    binning of the MC run). ``binning_dir`` None = <run_dir>/rebin.
+    """
+
+    enabled: bool = False
+    mode: str = "fit"
+    base_bin_width_gev: float = 1.0
+    binning_dir: Optional[str] = None
+    output_filename: str = "rebinned.root"
+    rho: float = 1.0
+    gpr_alpha_floor: float = 1.0
+    min_profile_entries: float = 5.0
+    z_veto_edge_gev: float = 106.18
+    top_roi_start_gev: float = 175.0
+    ztautau_cutoff_gev: float = 80.0
+
+    def __post_init__(self):
+        if self.mode not in ("fit", "cached"):
+            raise ValueError(f"rebin_config.mode must be 'fit' or 'cached', got {self.mode!r}")
+        if self.base_bin_width_gev <= 0 or self.rho <= 0:
+            raise ValueError("rebin_config.base_bin_width_gev and rho must be positive")
+        if self.enabled and self.mode == "cached" and not self.binning_dir:
+            raise ValueError("rebin_config.mode 'cached' needs binning_dir (the MC run's rebin dir)")
 
 
 @dataclass(frozen=True)
@@ -321,6 +367,7 @@ class PipelineConfig:
     # Cross-cutting configuration
     trigger_config: Optional[dict] = None
     mc_weighting_config: Optional[MCWeightingConfig] = None
+    rebin_config: Optional[RebinConfig] = None
     
     # Run metadata
     run_name: str = "pipeline_run"
@@ -438,6 +485,11 @@ class PipelineConfig:
                 min_events_per_fs=mass_dict.get("min_events_per_fs", 100),
                 include_subleading=mass_dict.get("include_subleading", True),
                 max_subleading_index=mass_dict.get("max_subleading_index", 1),
+                mass_resolution_enabled=bool((mass_dict.get("mass_resolution") or {}).get("enabled", False)),
+                mass_resolution_table=(mass_dict.get("mass_resolution") or {}).get("table"),
+                mass_resolution_apply_data_mc_scale=bool(
+                    (mass_dict.get("mass_resolution") or {}).get("apply_data_mc_scale", True)
+                ),
             )
         
         # Parse post-processing config if enabled
@@ -457,10 +509,11 @@ class PipelineConfig:
         histogram_creation_config = None
         if tasks.do_histogram_creation:
             hist_dict = config_dict.get("histogram_creation_task_config", {})
+            bin_width = hist_dict.get("bin_width_gev", 10.0)
             histogram_creation_config = HistogramCreationConfig(
                 input_dir=hist_dict["input_dir"],
                 output_dir=hist_dict["output_dir"],
-                bin_width_gev=hist_dict.get("bin_width_gev", 10.0),
+                bin_width_gev=tuple(bin_width) if isinstance(bin_width, (list, tuple)) else bin_width,
                 single_output_file=hist_dict.get("single_output_file", False),
                 output_filename=hist_dict.get("output_filename"),
                 exclude_outliers=hist_dict.get("exclude_outliers", True),
@@ -471,6 +524,8 @@ class PipelineConfig:
                 trim_empty_bins=hist_dict.get("trim_empty_bins", False),
                 also_save_pre_postproc=hist_dict.get("also_save_pre_postproc", False),
                 pre_postproc_filename=hist_dict.get("pre_postproc_filename"),
+                resolution_profile_bin_width_gev=hist_dict.get("resolution_profile_bin_width_gev"),
+                process_groups=hist_dict.get("process_groups"),
             )
         
         # Parse MC weighting config (optional cross-cutting section)
@@ -487,6 +542,11 @@ class PipelineConfig:
             if mc_weighting_config.enabled and not (config_dict.get("parsing_task_config") or {}).get("parse_mc", False):
                 raise ValueError("mc_weighting_config.enabled requires parsing_task_config.parse_mc: true")
 
+        rebin_config = None
+        rebin_dict = config_dict.get("rebin_config")
+        if rebin_dict:
+            rebin_config = RebinConfig(**rebin_dict)
+
         # Parse run metadata
         run_metadata = config_dict.get("run_metadata", {})
         
@@ -498,6 +558,7 @@ class PipelineConfig:
             histogram_creation_config=histogram_creation_config,
             trigger_config=config_dict.get("trigger_config"),
             mc_weighting_config=mc_weighting_config,
+            rebin_config=rebin_config,
             run_name=run_metadata.get("run_name", "pipeline_run"),
             batch_job_index=run_metadata.get("batch_job_index"),
             total_batch_jobs=run_metadata.get("total_batch_jobs"),

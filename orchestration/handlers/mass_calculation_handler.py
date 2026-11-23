@@ -100,7 +100,24 @@ class MassCalculationHandler(StateHandler):
             "mc_weighting_enabled": bool(mc_cfg and mc_cfg.enabled),
             "mc_use_pileup_weight": bool(mc_cfg and mc_cfg.enabled and mc_cfg.use_pileup_weight),
             "mc_norm_by_dsid": {},
+            "resolution_table": None,
         }
+        if mc.mass_resolution_enabled:
+            from services.calculations.mass_resolution import ObjectResolutionTable
+            config_dict["resolution_table"] = ObjectResolutionTable.from_json(
+                mc.mass_resolution_table,
+                apply_data_mc_scale=mc.mass_resolution_apply_data_mc_scale,
+            )
+            missing = [o for o in mc.objects_to_calculate if not config_dict["resolution_table"].has(o)]
+            if missing:
+                raise ValueError(
+                    f"mass_resolution is enabled but the table has no resolution for {missing}"
+                )
+            self.logger.info(
+                "Per-event mass resolution on: table "
+                f"{mc.mass_resolution_table or 'packaged default'}, data/MC scale "
+                f"{'applied' if mc.mass_resolution_apply_data_mc_scale else 'not applied'}"
+            )
         # {release: {dsid: w_norm}} — metadata is scoped per Open Data release.
         self._mc_norm_by_release: Dict[str, Dict[int, float]] = {}
         # {release: {dsid: campaign}} — the campaign each cached w_norm was computed for.
