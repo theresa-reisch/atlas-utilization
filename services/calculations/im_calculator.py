@@ -19,6 +19,10 @@ class IMCalculator:
         ("Electrons", "e"), ("Muons", "m"), ("Jets", "j"),
         ("Photons", "g"), ("Taus", "t"), ("BJets", "b"),
     )
+    # Final states hold at most this many objects. Events with more non-light-jet
+    # objects (e, mu, b, ...) are dropped; light jets beyond the free slots are
+    # merged into the capped category, so its jet count is inclusive (>=).
+    MAX_FS_OBJECTS = 4
 
     def __init__(self, events: ak.Array, min_events_per_fs: int,
                  min_k: int, max_k: int, min_n: int, max_n: int):
@@ -94,6 +98,8 @@ class IMCalculator:
         ]
         if len(total_types) < self.min_n or len(total_types) > self.max_n:
             return False
+        if sum(c for name, c in total_types if name != "Jets") > self.MAX_FS_OBJECTS:
+            return False
         for particle_type, count in total_types:
             if count < self.min_k:
                 return False
@@ -123,7 +129,7 @@ class IMCalculator:
         return self.events[mask]
 
     @staticmethod
-    def _limit_particles_in_fs(final_state: str, threshold: int = 4) -> str:
+    def _limit_particles_in_fs(final_state: str, threshold: int = MAX_FS_OBJECTS) -> str:
         return physics_calcs.limit_particles_in_fs(final_state, threshold)
 
     @staticmethod

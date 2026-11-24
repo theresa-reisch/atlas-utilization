@@ -273,3 +273,18 @@ def test_trim_keeps_profiles():
     p.SetDirectory(0)
     p.Fill(5.5, 2.0)
     assert slice_empty_bins(p) is p
+
+
+def test_final_state_object_cap():
+    # At most 4 non-light-jet objects; light jets fill the free slots and are
+    # inclusive (>=) once the category is full.
+    calc = IMCalculator(ak.Array([{}]), 1, 1, 4, 1, 4)
+    types = [("Electrons", "e", None), ("Muons", "m", None),
+             ("Jets", "j", None), ("BJets", "b", None)]
+    assert calc._is_valid_fs((2, 2, 0, 0), types)
+    assert calc._is_valid_fs((2, 1, 7, 1), types)
+    assert not calc._is_valid_fs((2, 2, 0, 1), types)   # 5 non-jet objects
+    assert not calc._is_valid_fs((3, 2, 3, 0), types)
+    assert calc._limit_particles_in_fs("1e_0m_6j_1b") == "1e_0m_2j_1b"
+    assert calc._limit_particles_in_fs("2e_2m_3j_0b") == "2e_2m_0j_0b"
+    assert calc._limit_particles_in_fs("1e_0m_2j_0b") == "1e_0m_2j_0b"
