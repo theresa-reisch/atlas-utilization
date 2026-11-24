@@ -215,7 +215,7 @@ histogram_creation_task_config:
   # ===OUTPUT===
   single_output_file: true
   output_filename: *histogram_filename
-  exclude_outliers: true # was designed to remove high-mass outliers from very broad distributions, but it doesn't work properly during merging
+  exclude_outliers: false # keep the high-mass tail; the rebin step ends the binning at min_tail_events
   use_bumpnet_naming: true               # mass_<combo>_cat_<final_state> format
   apply_peak_removal_at_histogram_level: false
   trim_empty_bins: false                 # slice each histogram to its first..last non-empty bin (after hadd in batch runs)
@@ -243,3 +243,4 @@ rebin_config:
   binning_dir: null                      # null = <run_dir>/rebin
   output_filename: rebinned.root
   rho: 1.0                               # bin width = sigma_m / rho
+  min_tail_events: 1.0                   # binning ends where < 1 expected background event lies above

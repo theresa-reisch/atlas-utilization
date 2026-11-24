@@ -72,6 +72,9 @@ class RebinSettings:
     z_veto_edge_gev: float = 91.18 + 15.0
     top_roi_start_gev: float = 175.0
     ztautau_cutoff_gev: float = 80.0
+    # The binning ends where the expected background above it drops below this
+    # many events (weighted, i.e. at the run's luminosity); 0 = last filled bin.
+    min_tail_events: float = 1.0
 
 
 @dataclass
@@ -138,6 +141,22 @@ def _filled_range(hist) -> Optional[Tuple[float, float]]:
         return None
     edges = _low_edges(hist)
     return float(edges[filled[0]]), float(edges[filled[-1] + 1])
+
+
+def tail_end(hist, min_tail_events: float) -> Optional[float]:
+    """Lowest grid edge above which the expected content is below ``min_tail_events``.
+
+    The tail above it (including the overflow) holds fewer than ``min_tail_events``
+    expected events. None when the whole histogram holds fewer.
+    """
+    contents = _contents(hist)
+    overflow = float(hist.GetBinContent(hist.GetNbinsX() + 1))
+    # tail[k] = content of bins k..end + overflow
+    tail = np.concatenate([np.cumsum(contents[::-1])[::-1], [0.0]]) + overflow
+    above = np.nonzero(tail >= min_tail_events)[0]
+    if len(above) == 0:
+        return None
+    return float(_low_edges(hist)[above[-1] + 1])
 
 
 def _integral(hist) -> float:
@@ -266,19 +285,29 @@ def derive_binning(base: str, hraw, profile, process_hists: Dict[str, object],
         raise ValueError(f"{base}: input bin width {width} != base_bin_width_gev "
                          f"{settings.base_bin_width_gev}")
 
+    stop = filled[1]
+    if settings.min_tail_events > 0:
+        end = tail_end(hraw, settings.min_tail_events)
+        if end is None or end <= filled[0]:
+            return None
+        stop = min(stop, end)
+
     x, y, yerr = profile_points(profile, settings.min_profile_entries)
     if len(x) == 0:
         return None
-    grid = np.arange(filled[0], filled[1] + width, width)
+    grid = np.arange(filled[0], stop + width, width)
     sigma, method = fit_sigma_curve(x, y, yerr, grid, settings)
 
     def sigma_at(m):
         return float(np.interp(m, grid, sigma))
 
-    full = resolution_edges(filled[0], filled[1], sigma_at, origin, width, settings.rho)
+    full = resolution_edges(filled[0], stop, sigma_at, origin, width, settings.rho)
     if len(full) < 2:
         return None
     notes = [f"sigma fit: {method} on {len(x)} profile points"]
+    if stop < filled[1]:
+        notes.append(f"end at {stop:.0f} GeV: < {settings.min_tail_events:g} expected events above "
+                     f"(last filled bin {filled[1]:.0f} GeV)")
     rebinned = _rebinned_contents(_contents(hraw), origin, width, full)
     roi = roi_edges(full, rebinned, combination_objects(base), _integral(hraw),
                     _integral(process_hists.get(TOP_GROUP)),

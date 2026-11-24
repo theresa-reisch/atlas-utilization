@@ -186,6 +186,7 @@ class PipelineExecutor:
             z_veto_edge_gev=rc.z_veto_edge_gev,
             top_roi_start_gev=rc.top_roi_start_gev,
             ztautau_cutoff_gev=rc.ztautau_cutoff_gev,
+            min_tail_events=rc.min_tail_events,
         )
         self.logger.info(f"Resolution rebinning ({rc.mode}) of {merged_path}")
         return rebin_file(merged_path, settings)

@@ -275,6 +275,7 @@ class RebinConfig:
     z_veto_edge_gev: float = 106.18
     top_roi_start_gev: float = 175.0
     ztautau_cutoff_gev: float = 80.0
+    min_tail_events: float = 1.0   # binning ends where < this many expected bkg events lie above
 
     def __post_init__(self):
         if self.mode not in ("fit", "cached"):
@@ -546,6 +547,18 @@ class PipelineConfig:
         rebin_dict = config_dict.get("rebin_config")
         if rebin_dict:
             rebin_config = RebinConfig(**rebin_dict)
+        # The binning is decided by the background run alone (mode "fit"). A run
+        # that reuses it (mode "cached": signal, data) only fills those bins, so
+        # its own events must not be cut by the main/outlier split, which depends
+        # on where gaps fall in that run's own spectrum.
+        if (rebin_config and rebin_config.enabled and rebin_config.mode == "cached"
+                and histogram_creation_config and histogram_creation_config.exclude_outliers):
+            import logging
+            from dataclasses import replace
+            histogram_creation_config = replace(histogram_creation_config, exclude_outliers=False)
+            logging.getLogger(__name__).info(
+                "rebin_config.mode=cached: exclude_outliers set to false; this run follows the "
+                "background binning and keeps all its events")
 
         # Parse run metadata
         run_metadata = config_dict.get("run_metadata", {})

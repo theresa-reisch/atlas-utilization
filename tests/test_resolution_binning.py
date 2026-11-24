@@ -288,3 +288,26 @@ def test_final_state_object_cap():
     assert calc._limit_particles_in_fs("1e_0m_6j_1b") == "1e_0m_2j_1b"
     assert calc._limit_particles_in_fs("2e_2m_3j_0b") == "2e_2m_0j_0b"
     assert calc._limit_particles_in_fs("1e_0m_2j_0b") == "1e_0m_2j_0b"
+
+
+def test_cached_binning_keeps_outliers():
+    """A run that reuses the background binning (signal, data) keeps all its events."""
+    import yaml
+    from domain.config import PipelineConfig
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "..", "config.baobab_mc.yaml")))
+    cfg["histogram_creation_task_config"]["exclude_outliers"] = True
+    fit = PipelineConfig.from_dict(cfg)
+    assert fit.histogram_creation_config.exclude_outliers is True
+    cfg["rebin_config"].update(mode="cached", binning_dir="/some/bkg/run/rebin")
+    cached = PipelineConfig.from_dict(cfg)
+    assert cached.histogram_creation_config.exclude_outliers is False
+
+
+def test_tail_end_one_expected_event():
+    h = ROOT.TH1D("h_tail", "", 100, 0, 100)
+    h.SetDirectory(0)
+    for x, w in ((10.5, 50.0), (40.5, 0.6), (60.5, 0.3), (80.5, 0.3)):
+        h.Fill(x, w)
+    # above 41: 0.6 expected events (< 1); above 40: 1.2 -> the binning ends at 41
+    assert rb.tail_end(h, 1.0) == 41.0
+    assert rb.tail_end(h, 100.0) is None
