@@ -17,9 +17,8 @@ import numpy as np
 
 from services.pipelines.im_pipeline import MC_WEIGHT_SUFFIX, SIBLING_SUFFIXES, is_sibling_signature
 from services.storage.sqlite_shards import (
+    ShardReader,
     SqliteArrayShardWriter,
-    iter_arrays_for_signature,
-    list_signatures,
     prune_final_states_below_min_events,
 )
 
@@ -198,9 +197,15 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
 
     writer = SqliteArrayShardWriter(shard_path)
 
-    signatures = set()
-    for filename in sqlite_files:
-        signatures.update(list_signatures(os.path.join(input_dir, filename)))
+    # One connection per shard, and each signature is only looked up in the
+    # shards that hold it (it used to be queried in every shard, with a new
+    # connection per query: quadratic in the number of shards).
+    reader = ShardReader([os.path.join(input_dir, f) for f in sqlite_files])
+    shard_sigs = {
+        filename: reader.signatures(os.path.join(input_dir, filename))
+        for filename in sqlite_files
+    }
+    signatures = set().union(*shard_sigs.values()) if shard_sigs else set()
 
     logger.info(
         f"Processing {len(signatures)} signatures from {len(sqlite_files)} IM shard file(s) "
@@ -234,12 +239,14 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
             for sig in chunk_sigs:
                 for filename in sqlite_files:
                     db_path = os.path.join(input_dir, filename)
-                    sig_chunks = list(iter_arrays_for_signature(db_path, sig))
-                    chunks.extend(sig_chunks)
+                    present = shard_sigs[filename]
+                    if sig in present:
+                        chunks.extend(reader.iter_arrays(db_path, sig))
                     # Gather the siblings in the SAME order so that mass[i]
                     # and sibling[i] stay aligned through every step.
                     for suffix, sib in sibling_chunks.items():
-                        sib.extend(iter_arrays_for_signature(db_path, sig + suffix))
+                        if sig + suffix in present:
+                            sib.extend(reader.iter_arrays(db_path, sig + suffix))
             if not chunks:
                 continue
 
@@ -307,6 +314,7 @@ def _process_im_sqlite(config: Dict, sqlite_files: List[str], logger: logging.Lo
         writer.commit()  # ← final commit for remainder    
     finally:
         writer.close()
+        reader.close()
 
     logger.info(f"Post-processing complete. Created {written} processed array chunks in {shard_name}.")
     return [shard_name]

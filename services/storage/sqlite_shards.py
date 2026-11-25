@@ -137,6 +137,41 @@ def iter_arrays_for_signature(
         yield _deserialize_array(payload)
 
 
+class ShardReader:
+    """Read-only access to several shard DBs with one open connection each.
+
+    Opening a new connection per query costs ~2 ms on BeeGFS, which dominates
+    post-processing once there are many shards and signatures.
+    """
+
+    def __init__(self, db_paths: List[str], table_name: str = "array_chunks"):
+        self.table_name = table_name
+        self.conns = {p: sqlite3.connect(p) for p in db_paths if os.path.exists(p)}
+
+    def signatures(self, db_path: str) -> set:
+        conn = self.conns.get(db_path)
+        if conn is None:
+            return set()
+        rows = conn.execute(f"SELECT DISTINCT signature FROM {self.table_name}").fetchall()
+        return {r[0] for r in rows}
+
+    def iter_arrays(self, db_path: str, signature: str) -> Iterator[np.ndarray]:
+        conn = self.conns.get(db_path)
+        if conn is None:
+            return
+        rows = conn.execute(
+            f"SELECT payload FROM {self.table_name} WHERE signature = ?",
+            (signature,),
+        ).fetchall()
+        for (payload,) in rows:
+            yield _deserialize_array(payload)
+
+    def close(self) -> None:
+        for conn in self.conns.values():
+            conn.close()
+        self.conns = {}
+
+
 def iter_all_chunks(
     db_path: str, table_name: str = "array_chunks"
 ) -> Iterator[tuple[str, np.ndarray]]:
